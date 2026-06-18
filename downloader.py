@@ -89,6 +89,22 @@ COMMON_LANGS = [
     "zh-Hant", "ar", "hi", "nl", "pl", "sv", "da", "fi", "nb", "tr",
 ]
 
+def get_video_info(video_id):
+    url = f"https://youtube.com/watch?v={video_id}"
+    ydl_opts = {"quiet": True, "no_warnings": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+            return {
+                "id": video_id,
+                "title": info.get("title", ""),
+                "thumbnail": info.get("thumbnail", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+                "channel": info.get("channel") or info.get("uploader", ""),
+                "duration": info.get("duration", 0),
+            }
+        except Exception as e:
+            raise Exception(f"Failed to get video info: {e}")
+
 def list_subtitles(video_id):
     url = f"https://youtube.com/watch?v={video_id}"
     ydl_opts = {"quiet": True, "no_warnings": True, "writesubtitles": True, "writeautomaticsub": True}

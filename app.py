@@ -133,6 +133,14 @@ def api_formats(video_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/video-info/<video_id>")
+def api_video_info(video_id):
+    try:
+        info = downloader.get_video_info(video_id)
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/download", methods=["POST"])
 def api_download():
     data = request.get_json()
