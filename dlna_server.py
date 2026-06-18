@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, DLNA_PORT, SERVER_NAME
 import metadata
 
+HOSTNAME = socket.gethostname()
 MY_UUID = str(uuid.uuid4())
 LOCAL_IP = None
 
@@ -40,7 +41,7 @@ class SSDPListener:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
-        mreq = struct.pack("4sl", socket.inet_aton(SSDP_MCAST), socket.INADDR_ANY)
+        mreq = struct.pack("4s4s", socket.inet_aton(SSDP_MCAST), socket.inet_aton("0.0.0.0"))
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         self.sock.bind(("0.0.0.0", SSDP_PORT))
         self.sock.settimeout(1.0)
@@ -52,7 +53,7 @@ class SSDPListener:
             "DATE: {}\r\n"
             "EXT:\r\n"
             "LOCATION: http://{}:{}/description.xml\r\n"
-            "SERVER: Linux/6.10, UPnP/1.0, {}/1.0\r\n"
+            "SERVER: {}/1.0 UPnP/1.0\r\n"
             "ST: {}\r\n"
             "USN: uuid:{}::{}\r\n"
             "\r\n"

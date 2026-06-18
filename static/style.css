@@ -263,3 +263,12 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 }
 .dl-task-status { font-size: 0.8em; color: #aaa; }
 .dl-task-status.status-paused { color: #ffaa00; }
+
+.subs-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.sub-pill {
+  display: inline-block; padding: 4px 10px; border-radius: 4px;
+  font-size: 0.8em; cursor: pointer; user-select: none;
+  background: #444; color: #888; transition: .15s;
+}
+.sub-pill.selected { background: #2a6b2a; color: #8f8; }
+.sub-pill:hover { filter: brightness(1.2); }

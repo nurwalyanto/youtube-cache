@@ -3,9 +3,12 @@ import json
 import re
 import time
 import threading
+import shutil
 import yt_dlp
 from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR
 import tasks
+
+FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 progress_listeners = {}
 cancel_flags = {}
@@ -231,14 +234,17 @@ def _find_subtitle_files(video_id):
                     pass
     return found
 
-def _download_subtitles(video_id, url):
+def _download_subtitles(video_id, url, subtitle_langs=None):
+    if subtitle_langs is not None and len(subtitle_langs) == 0:
+        return
+    langs = subtitle_langs if subtitle_langs is not None else COMMON_LANGS
     sub_opts = {
         "quiet": True,
         "no_warnings": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitlesformat": "vtt",
-        "subtitleslangs": COMMON_LANGS,
+        "subtitleslangs": langs,
         "skip_download": True,
         "outtmpl": os.path.join(SUBTITLES_DIR, "%(id)s.%(ext)s"),
     }
@@ -261,7 +267,7 @@ def resume_download(task_id, video_id, format_id):
     return download_video(video_id, format_id, task_id, resume=True)
 
 
-def download_video(video_id, format_id, task_id=None, resume=False):
+def download_video(video_id, format_id, task_id=None, resume=False, subtitle_langs=None):
     url = f"https://youtube.com/watch?v={video_id}"
     outtmpl = os.path.join(VIDEOS_DIR, "%(id)s.%(ext)s")
 
@@ -295,21 +301,30 @@ def download_video(video_id, format_id, task_id=None, resume=False):
             if task_id and task_id in progress_listeners:
                 progress_listeners[task_id]({"status": "processing", "percent": 100})
 
+    if subtitle_langs is None:
+        langs = COMMON_LANGS
+    elif len(subtitle_langs) == 0:
+        langs = []
+    else:
+        langs = subtitle_langs
+    write_subs = len(langs) > 0
+    write_auto = len(langs) > 0
+
     ydl_opts = {
         "format": format_id,
         "outtmpl": outtmpl,
         "merge_output_format": "mp4",
         "writethumbnail": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
+        "writesubtitles": write_subs,
+        "writeautomaticsub": write_auto,
         "subtitlesformat": "vtt",
-        "subtitleslangs": COMMON_LANGS,
+        "subtitleslangs": langs,
         "embedsubs": False,
         "ignoreerrors": True,
         "progress_hooks": [progress_hook],
         "quiet": True,
         "no_warnings": True,
-        "ffmpeg_location": "/usr/bin/ffmpeg",
+        "ffmpeg_location": FFMPEG_PATH,
         "nopart": True,
         "postprocessor_args": {"ffmpeg": ["-movflags", "+faststart"]},
         "cookiesfrombrowser": ("firefox",),
@@ -484,7 +499,7 @@ def download_video(video_id, format_id, task_id=None, resume=False):
                 if pause_flags.get(task_id):
                     raise PauseException()
 
-                sub_thread = threading.Thread(target=_download_subtitles, args=(video_id, url))
+                sub_thread = threading.Thread(target=_download_subtitles, args=(video_id, url, subtitle_langs))
                 sub_thread.start()
                 sub_thread.join()
 
@@ -508,7 +523,7 @@ def download_video(video_id, format_id, task_id=None, resume=False):
                 v_ext = os.path.splitext(v_path)[1]
                 merged_ext = "webm" if v_ext == ".webm" else "mp4"
                 merged = os.path.join(VIDEOS_DIR, f"{info_pre['id']}.{merged_ext}")
-                ffmpeg_args = ["/usr/bin/ffmpeg", "-y", "-i", v_path, "-i", a_path, "-c", "copy"]
+                ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy"]
                 if merged_ext == "mp4":
                     ffmpeg_args += ["-movflags", "+faststart"]
                 ffmpeg_args.append(merged)

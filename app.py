@@ -149,6 +149,7 @@ def api_download():
     title = data.get("title", video_id)
     thumbnail = data.get("thumbnail", "")
     format_label = data.get("format_label", format_id)
+    subtitle_langs = data.get("subtitles")
     if not video_id or not format_id:
         return jsonify({"error": "Missing video_id or format_id"}), 400
 
@@ -158,7 +159,7 @@ def api_download():
 
     listener = _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
     downloader.progress_listeners[task_id] = listener
-    downloader.download_video(video_id, format_id, task_id)
+    downloader.download_video(video_id, format_id, task_id, subtitle_langs=subtitle_langs)
     return jsonify({"task_id": task_id, "status": "started"})
 
 @app.route("/api/progress/<task_id>")
@@ -342,4 +343,4 @@ if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     resume_pending_tasks()
 
 if __name__ == "__main__":
-    app.run(host=HOST, port=PORT, debug=True, threaded=True)
+    app.run(host=HOST, port=PORT, debug=True)

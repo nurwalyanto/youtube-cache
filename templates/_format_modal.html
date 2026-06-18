@@ -25,6 +25,19 @@ let selectedFormatId = null;
 let selectedTitle = '';
 let selectedThumb = '';
 let selectedFormatLabel = '';
+let selectedSubs = [];
+
+function toggleSub(el) {
+  var lang = el.getAttribute('data-lang');
+  var idx = selectedSubs.indexOf(lang);
+  if (idx === -1) {
+    selectedSubs.push(lang);
+    el.classList.add('selected');
+  } else {
+    selectedSubs.splice(idx, 1);
+    el.classList.remove('selected');
+  }
+}
 
 function showFormats(videoId, title, thumb) {
   selectedVideoId = videoId;
@@ -71,7 +84,15 @@ function showFormats(videoId, title, thumb) {
       formatsEl.appendChild(div);
     });
     if (data.subtitles && Object.keys(data.subtitles).length > 0) {
-      document.getElementById('modal-subs').innerHTML = '<h3>Subtitles Available</h3><p class="sub-note">' + Object.keys(data.subtitles).join(', ') + ' (will download automatically)</p>';
+      selectedSubs = Object.keys(data.subtitles);
+      var html = '<h3>Subtitles</h3><div class="subs-pills">';
+      Object.keys(data.subtitles).forEach(function(lang) {
+        html += '<span class="sub-pill selected" data-lang="' + lang + '" onclick="toggleSub(this)">' + lang + '</span>';
+      });
+      html += '</div>';
+      document.getElementById('modal-subs').innerHTML = html;
+    } else {
+      selectedSubs = [];
     }
   });
 }
@@ -95,7 +116,8 @@ async function startDownload() {
       format_id: selectedFormatId,
       title: selectedTitle,
       thumbnail: selectedThumb,
-      format_label: selectedFormatLabel
+      format_label: selectedFormatLabel,
+      subtitles: selectedSubs
     })
   });
   const data = await res.json();
