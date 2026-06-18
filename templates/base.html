@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}YouTube Cache{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <nav>
+    <a href="/" class="logo">▶ YouTube Cache</a>
+    <div class="nav-links">
+      <a href="/search">Search & Download</a>
+      <a href="#" id="dl-toggle" class="dl-indicator" onclick="toggleDownloads(event)" style="display:none">
+        <span id="dl-count">0</span> downloading
+      </a>
+    </div>
+  </nav>
+
+  <div id="dl-drawer" class="dl-drawer hidden">
+    <div class="dl-drawer-header">
+      <h3>Active Downloads</h3>
+      <button onclick="toggleDownloads()">&times;</button>
+    </div>
+    <div id="dl-drawer-tasks"></div>
+  </div>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <script>
+let dlDrawerOpen = false;
+
+function toggleDownloads(e) {
+  if (e) e.preventDefault();
+  const d = document.getElementById('dl-drawer');
+  dlDrawerOpen = !dlDrawerOpen;
+  d.classList.toggle('hidden', !dlDrawerOpen);
+}
+
+function showDownloads() {
+  const d = document.getElementById('dl-drawer');
+  dlDrawerOpen = true;
+  d.classList.remove('hidden');
+}
+
+function updateDownloadsUI(tasks) {
+  const indicator = document.getElementById('dl-toggle');
+  const count = document.getElementById('dl-count');
+  const container = document.getElementById('dl-drawer-tasks');
+
+  const active = tasks.filter(t => t.status === 'queued' || t.status === 'downloading' || t.status === 'processing');
+
+  if (active.length === 0) {
+    indicator.style.display = 'none';
+    container.innerHTML = '<p class="dl-empty">No active downloads</p>';
+    return;
+  }
+
+  indicator.style.display = 'inline';
+  count.textContent = active.length;
+
+  container.innerHTML = active.map(t => {
+    const pct = t.percent || 0;
+    const statusClass = t.status === 'processing' ? 'status-processing' : '';
+    const partialBtn = t.has_partial ? `<button class="btn-play-inline" onclick="event.stopPropagation(); window.location.href='/video/${t.video_id}'">Play</button>` : '';
+    return `<div class="dl-task" data-task-id="${t.task_id}">
+      <div class="dl-task-thumb"><img src="${t.thumbnail || ''}" alt="" onerror="this.style.display='none'"></div>
+      <div class="dl-task-info">
+        <div class="dl-task-title">${t.title || 'Unknown'}</div>
+        <div class="dl-task-meta">${t.format_label || ''}</div>
+        <div class="progress-bar dl-progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+        <div class="dl-task-status ${statusClass}">${t.status} ${pct}%</div>
+      </div>
+      <div class="task-actions">
+        ${partialBtn}
+        <button class="btn-cancel" onclick="cancelDownload('${t.task_id}')">&times;</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function cancelDownload(taskId) {
+  await fetch('/api/active-tasks/' + taskId, {method: 'DELETE'});
+  const el = document.querySelector(`[data-task-id="${taskId}"]`);
+  if (el) el.remove();
+  fetchActiveTasks();
+}
+
+async function fetchActiveTasks() {
+  try {
+    const r = await fetch('/api/active-tasks');
+    const tasks = await r.json();
+    updateDownloadsUI(tasks);
+    checkCompletion(tasks);
+  } catch(e) {}
+}
+
+let lastDoneCount = 0;
+
+function checkCompletion(tasks) {
+  const newDone = tasks.filter(t => t.status === 'done' || t.status === 'error');
+  if (newDone.length > lastDoneCount) {
+    lastDoneCount = newDone.length;
+    if (document.getElementById('dl-drawer-tasks') && !document.querySelector('[data-task-id]')) {
+      setTimeout(() => { window.location.reload(); }, 2000);
+    }
+  }
+}
+
+setInterval(fetchActiveTasks, 2000);
+document.addEventListener('DOMContentLoaded', fetchActiveTasks);
+  </script>
+</body>
+</html>

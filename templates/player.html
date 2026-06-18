@@ -1,0 +1,320 @@
+{% extends "base.html" %}
+{% block title %}{{ video.title }} - YouTube Cache{% endblock %}
+{% block content %}
+{% if is_partial %}
+<div class="partial-banner">Partial download -- streaming while downloading</div>
+{% endif %}
+<div class="player-container">
+  <div class="player-wrapper">
+    <video id="player" controls autoplay>
+      {% for sub in video.subtitles %}
+      <track label="{{ sub.lang }}" kind="subtitles" srclang="{{ sub.lang }}" src="/sub/{{ video.id }}/{{ sub.lang }}"{% if loop.first %} default{% endif %}>
+      {% endfor %}
+    </video>
+  </div>
+
+  <div class="video-meta">
+    <h2>{{ video.title }}</h2>
+    <div class="meta-row">
+      <span class="channel">{{ video.channel }}</span>
+      <span class="duration">{{ video.duration // 60 }}:{{ '%02d' % (video.duration % 60) }}</span>
+      <button class="btn-danger" onclick="deleteVideo()">Delete</button>
+    </div>
+    {% if video.description %}
+    <details class="description">
+      <summary>Description</summary>
+      <p>{{ video.description }}</p>
+    </details>
+    {% endif %}
+    {% if video.subtitles %}
+    <div class="subs-info">
+      <h3>Subtitles</h3>
+      <p>{{ video.subtitles|map(attribute='lang')|join(', ') }}</p>
+    </div>
+    {% endif %}
+    {% if is_partial %}
+    <div id="refresh-bar" style="display:none">
+      <button onclick="refreshSeek()" class="btn" title="Refresh seek range as download progresses">Refresh seek range</button>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<audio id="audioPlayer" preload="auto"></audio>
+
+<script>
+var VIDEO_ID = '{{ video.id }}';
+var videoEl = document.getElementById('player');
+var audioEl = document.getElementById('audioPlayer');
+var audioSyncing = false;
+var mseActive = false;
+
+videoEl.addEventListener('error', function() {
+  var err = videoEl.error;
+  console.error('Video element error:', err ? err.message || err.code : 'unknown');
+  if (err && err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+    console.error('Source not supported - check file format and codec');
+  }
+});
+
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+function appendToBuffer(sb, data) {
+  return new Promise(function(resolve, reject) {
+    function onUpdate() {
+      sb.removeEventListener('updateend', onUpdate);
+      sb.removeEventListener('error', onError);
+      resolve();
+    }
+    function onError() {
+      sb.removeEventListener('updateend', onUpdate);
+      sb.removeEventListener('error', onError);
+      var err = new Error('SourceBuffer error');
+      err.sourceBufferError = true;
+      reject(err);
+    }
+    sb.addEventListener('updateend', onUpdate);
+    sb.addEventListener('error', onError);
+    sb.appendBuffer(data);
+  });
+}
+
+var _mseFellBack = false;
+
+function fallbackFromMSE() {
+  if (_mseFellBack) return;
+  _mseFellBack = true;
+  mseActive = false;
+  videoEl.src = '/stream/' + VIDEO_ID;
+  videoEl.currentTime = videoEl.currentTime || 0;
+  videoEl.play()['catch'](function() {});
+  showRefreshButton();
+  startCompletionWatcher();
+}
+
+var _completionWatcher = null;
+
+function startCompletionWatcher() {
+  if (_completionWatcher) return;
+  _completionWatcher = setInterval(async function() {
+    try {
+      var resp = await fetch('/api/stream-info/' + VIDEO_ID);
+      var info = await resp.json();
+      if (info.is_done) {
+        clearInterval(_completionWatcher);
+        _completionWatcher = null;
+        switchToComplete();
+      }
+    } catch (e) {}
+  }, 5000);
+}
+
+function showRefreshButton() {
+  var bar = document.getElementById('refresh-bar');
+  if (bar) bar.style.display = '';
+  startCompletionWatcher();
+}
+
+function refreshSeek() {
+  var ct = videoEl.currentTime;
+  videoEl.src = '/stream/' + VIDEO_ID;
+  videoEl.currentTime = ct || 0;
+  videoEl.play()['catch'](function() {});
+  if (audioSyncing) {
+    audioEl.src = '/stream_audio/' + VIDEO_ID;
+    audioEl.currentTime = ct || 0;
+  }
+}
+
+async function initMSE(info) {
+  mseActive = true;
+  var ms = new MediaSource();
+  videoEl.src = URL.createObjectURL(ms);
+
+  ms.addEventListener('sourceopen', async function() {
+    try {
+      var sb = ms.addSourceBuffer(info.video_mime);
+
+      var initData = null;
+      for (var retry = 0; retry < 10; retry++) {
+        var initResp = await fetch('/api/init-segment/' + VIDEO_ID);
+        if (initResp.status === 200) {
+          initData = await initResp.arrayBuffer();
+          if (initData.byteLength > 0) break;
+        }
+        await sleep(2000);
+      }
+      if (!initData) {
+        throw new Error('Init segment not available after retries');
+      }
+      await appendToBuffer(sb, initData);
+
+      if (info.duration && info.duration > 0) {
+        ms.duration = info.duration;
+      }
+
+      var lastOffset = parseInt(initResp.headers.get('X-Init-Size'));
+      if (!lastOffset) throw new Error('Missing X-Init-Size header');
+      pollChunks(sb, ms, lastOffset);
+    } catch (e) {
+      console.error('MSE init failed, falling back:', e);
+      mseActive = false;
+      videoEl.src = '/stream/' + VIDEO_ID;
+      if (info.has_audio && info.audio_mime) {
+        tryAudio();
+      }
+      showRefreshButton();
+    }
+  });
+
+  tryAudio();
+  pollCompletion();
+}
+
+async function pollChunks(sb, ms, offset) {
+  while (mseActive) {
+    await sleep(3000);
+
+    try {
+      if (sb.updating) {
+        await new Promise(function(r) { sb.addEventListener('updateend', r, { once: true }); });
+      }
+
+      var resp = await fetch('/api/video-chunks/' + VIDEO_ID + '?after=' + offset);
+      if (resp.status === 204) continue;
+
+      var chunkEnd = parseInt(resp.headers.get('X-Chunk-End'));
+      if (chunkEnd <= offset) continue;
+
+      var data = await resp.arrayBuffer();
+      await appendToBuffer(sb, data);
+      offset = chunkEnd;
+    } catch (e) {
+      if (e.sourceBufferError) {
+        console.error('SourceBuffer error in pollChunks, falling back');
+        fallbackFromMSE();
+        return;
+      }
+      await sleep(1000);
+    }
+  }
+}
+
+async function pollCompletion() {
+  while (mseActive) {
+    await sleep(5000);
+    try {
+      var resp = await fetch('/api/stream-info/' + VIDEO_ID);
+      var info = await resp.json();
+      if (info.is_done) {
+        switchToComplete();
+        return;
+      }
+    } catch (e) {}
+  }
+}
+
+function switchToComplete() {
+  mseActive = false;
+  var ct = videoEl.currentTime;
+  videoEl.src = '/stream/' + VIDEO_ID;
+  videoEl.currentTime = ct || 0;
+  videoEl.play()['catch'](function() {});
+  if (audioSyncing) {
+    audioSyncing = false;
+    audioEl.pause();
+    audioEl.removeAttribute('src');
+  }
+  _mseFellBack = true;
+}
+
+var _audioStarted = false;
+
+function tryAudio() {
+  if (_audioStarted) return;
+  _audioStarted = true;
+  audioSyncing = true;
+  audioEl.src = '/stream_audio/' + VIDEO_ID;
+
+  videoEl.addEventListener('play', function() { if (audioSyncing) audioEl.play()['catch'](function() {}); });
+  videoEl.addEventListener('pause', function() { if (audioSyncing) audioEl.pause(); });
+  videoEl.addEventListener('seeked', function() {
+    if (audioSyncing && !isNaN(videoEl.currentTime)) {
+      audioEl.currentTime = videoEl.currentTime;
+    }
+  });
+  videoEl.addEventListener('timeupdate', function() {
+    if (audioSyncing && !isNaN(audioEl.currentTime) && !isNaN(videoEl.currentTime) &&
+        Math.abs(audioEl.currentTime - videoEl.currentTime) > 0.5) {
+      audioEl.currentTime = videoEl.currentTime;
+    }
+  });
+}
+
+async function initPlayer() {
+  var resp = await fetch('/api/stream-info/' + VIDEO_ID);
+  var info = await resp.json();
+  if (!info) return;
+
+  if (info.is_done) {
+    videoEl.src = '/stream/' + VIDEO_ID;
+    return;
+  }
+
+  if (info.is_dash && info.has_video && info.video_mime && info.init_video &&
+      typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(info.video_mime)) {
+    initMSE(info);
+    return;
+  }
+
+  // DASH partial but init segment not ready yet - poll until it is
+  if (info.is_dash && !info.is_done && !info.has_video && info.has_audio) {
+    waitForMSE(info);
+    return;
+  }
+
+  if (info.has_video) {
+    videoEl.src = '/stream/' + VIDEO_ID;
+  }
+  if (info.has_audio && info.audio_mime) {
+    tryAudio();
+  }
+  showRefreshButton();
+}
+
+async function waitForMSE(info) {
+  if (info.has_audio && info.audio_mime) {
+    tryAudio();
+  }
+  var attempts = 0;
+  while (true) {
+    await sleep(2000);
+    attempts++;
+    try {
+      var resp = await fetch('/api/stream-info/' + VIDEO_ID);
+      var updated = await resp.json();
+      if (updated.is_done) {
+        videoEl.src = '/stream/' + VIDEO_ID;
+        return;
+      }
+      if (updated.has_video && updated.init_video && updated.video_mime &&
+          MediaSource.isTypeSupported(updated.video_mime)) {
+        initMSE(updated);
+        return;
+      }
+    } catch (e) {}
+    if (attempts > 30) {
+      showRefreshButton();
+      return;
+    }
+  }
+}
+
+initPlayer();
+
+function deleteVideo() {
+  if (!confirm('Delete "{{ video.title }}"?')) return;
+  fetch('/api/library/{{ video.id }}', {method: 'DELETE'}).then(function() { window.location.href = '/'; });
+}
+</script>
+{% endblock %}
