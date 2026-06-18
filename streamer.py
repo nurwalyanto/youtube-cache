@@ -8,11 +8,29 @@ mimetypes.add_type('image/webp', '.webp')
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".m4v", ".m4a"}
+MIN_VIDEO_SIZE = 102400
 
+AUDIO_FORMAT_IDS = {"139", "140", "141", "249", "250", "251", "255", "256", "258"}
+
+def _is_audio_file(filename):
+    name, ext = os.path.splitext(filename)
+    if ext == ".m4a":
+        return True
+    if ".f" in name:
+        parts = name.split(".f")
+        if len(parts) >= 2 and parts[-1] in AUDIO_FORMAT_IDS:
+            return True
+    return False
+
+def _parse_format_id(filename):
+    name, ext = os.path.splitext(filename)
+    if ".f" in name:
+        parts = name.split(".f")
+        return parts[-1]
+    return None
 
 def get_video_path(video_id, exact_only=False, prefer_dash=False):
     if prefer_dash:
-        # Return DASH intermediate .f{fmt}.mp4 file if it exists (partial download)
         actives = tasks.get_active_tasks()
         dash_fmt = None
         for t in actives.values():
@@ -21,17 +39,28 @@ def get_video_path(video_id, exact_only=False, prefer_dash=False):
                 break
         if dash_fmt:
             candidate = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_fmt}.mp4")
-            if os.path.exists(candidate):
+            if os.path.exists(candidate) and os.path.getsize(candidate) >= MIN_VIDEO_SIZE:
                 return candidate
     for f in os.listdir(VIDEOS_DIR):
         name, ext = os.path.splitext(f)
+        fpath = os.path.join(VIDEOS_DIR, f)
         if name == video_id and ext in VIDEO_EXTS:
-            return os.path.join(VIDEOS_DIR, f)
+            if os.path.getsize(fpath) >= MIN_VIDEO_SIZE:
+                return fpath
     if not exact_only:
+        best = None
         for f in os.listdir(VIDEOS_DIR):
             name, ext = os.path.splitext(f)
-            if ext in VIDEO_EXTS and ".f" in name and name.split(".")[0] == video_id:
-                return os.path.join(VIDEOS_DIR, f)
+            if ext not in VIDEO_EXTS or ".f" not in name or name.split(".")[0] != video_id:
+                continue
+            if _is_audio_file(f):
+                continue
+            fpath = os.path.join(VIDEOS_DIR, f)
+            if os.path.getsize(fpath) < MIN_VIDEO_SIZE:
+                continue
+            best = fpath
+        if best:
+            return best
     return None
 
 
@@ -198,9 +227,71 @@ def stream_audio_track(video_id):
     return resp
 
 
+def _ebml_vint_size(first_byte):
+    """Return total bytes of an EBML variable-length integer given first byte."""
+    if first_byte == 0:
+        return 0
+    mask = 0x80
+    for i in range(1, 9):
+        if first_byte & mask:
+            return i
+        mask >>= 1
+    return 8
+
+def _ebml_read_vint(f):
+    buf = f.read(1)
+    if not buf:
+        return None, 0
+    length = _ebml_vint_size(buf[0])
+    if length == 1:
+        return buf[0] & 0x7f, length
+    extra = f.read(length - 1)
+    if len(extra) < length - 1:
+        return None, 0
+    val = buf[0] & (0x7f >> (length - 1))
+    for b in extra:
+        val = (val << 8) | b
+    return val, length
+
+def _webm_init_offset(path):
+    """For WebM/EBML files, find offset of first Cluster element.
+    Returns the byte offset of the first Cluster ID, or None."""
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return None
+    if file_size < 12:
+        return None
+    with open(path, 'rb') as f:
+        pos = 0
+        while pos + 4 <= file_size:
+            f.seek(pos)
+            chunk = f.read(4)
+            if len(chunk) < 4:
+                break
+            if chunk == b'\x1a\x45\xdf\xa3':
+                pos += 4
+                _, _ = _ebml_read_vint(f)
+                continue
+            if chunk == b'\x18\x53\x80\x67':
+                pos += 4
+                _, _ = _ebml_read_vint(f)
+                continue
+            if chunk == b'\x1f\x43\xb6\x75':
+                return pos
+            pos += 1
+    return None
+
 def _init_segment_size(path):
     """Scan fMP4 from start, accumulate box sizes until first 'moof' box.
-    Returns offset of first moof (init segment size), or None if incomplete."""
+    For WebM files, scan for first Cluster element.
+    Returns offset of first moof/Cluster (init segment size), or None if incomplete."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".webm":
+        offset = _webm_init_offset(path)
+        if offset is not None and offset > 0:
+            return offset
+        return None
     try:
         file_size = os.path.getsize(path)
     except OSError:
@@ -231,12 +322,14 @@ def _init_segment_size(path):
 def _build_mime(codec):
     if not codec:
         return None
-    if any(codec.startswith(p) for p in ("avc1", "hev1", "hvc1", "av01", "vp09", "vp9")):
+    if any(codec.startswith(p) for p in ("avc1", "hev1", "hvc1", "av01")):
         return f'video/mp4; codecs="{codec}"'
-    if codec.startswith("av1"):
+    if any(codec.startswith(p) for p in ("vp09", "vp9", "av1")):
         return f'video/webm; codecs="{codec}"'
-    if any(codec.startswith(p) for p in ("mp4a", "opus")):
+    if codec.startswith("mp4a"):
         return f'audio/mp4; codecs="{codec}"'
+    if codec.startswith("opus"):
+        return f'audio/webm; codecs="{codec}"'
     return None
 
 
@@ -247,19 +340,23 @@ def stream_info(video_id):
     # Check merged file first (completed download)
     merged_path = get_video_path(video_id, exact_only=True)
     if merged_path and os.path.exists(merged_path):
-        return {
-            "is_dash": False,
-            "has_video": True,
-            "has_audio": True,
-            "video_mime": 'video/mp4; codecs="avc1.64002a"',
-            "audio_mime": None,
-            "video_size": os.path.getsize(merged_path),
-            "audio_size": None,
-            "init_video": None,
-            "init_audio": None,
-            "duration": _mvhd_duration(merged_path) or 0,
-            "is_done": True,
-        }
+        actives = tasks.get_active_tasks()
+        still_downloading = any(t["video_id"] == video_id for t in actives.values())
+        if not still_downloading:
+            mime, _ = mimetypes.guess_type(merged_path)
+            return {
+                "is_dash": False,
+                "has_video": True,
+                "has_audio": True,
+                "video_mime": mime or 'video/mp4',
+                "audio_mime": None,
+                "video_size": os.path.getsize(merged_path),
+                "audio_size": None,
+                "init_video": None,
+                "init_audio": None,
+                "duration": _mvhd_duration(merged_path) or 0,
+                "is_done": True,
+            }
 
     actives = tasks.get_active_tasks()
     result = {
@@ -284,8 +381,14 @@ def stream_info(video_id):
 
             if v_fmt and a_fmt:
                 result["is_dash"] = True
-                v_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{v_fmt}.mp4")
-                if os.path.exists(v_path) and os.path.getsize(v_path) > 0:
+                target = f"{video_id}.f{v_fmt}"
+                v_path = None
+                for f in os.listdir(VIDEOS_DIR):
+                    name, ext = os.path.splitext(f)
+                    if name == target and ext in VIDEO_EXTS:
+                        v_path = os.path.join(VIDEOS_DIR, f)
+                        break
+                if v_path and os.path.getsize(v_path) > 0:
                     init_video = _init_segment_size(v_path)
                     if init_video is not None:
                         result["has_video"] = True
@@ -318,11 +421,11 @@ def stream_info(video_id):
     if not result["has_video"] and not result["has_audio"]:
         fallback_video_path = None
         fallback_audio_path = None
+        fallback_is_dash = False
         # Check for exact-match regular file first (progressive download)
         exact = get_video_path(video_id, exact_only=True)
         if exact and os.path.exists(exact) and os.path.getsize(exact) > 0:
             fallback_video_path = exact
-            # Progressive files contain both video and audio
             result["has_audio"] = True
         # Scan for DASH .f* files
         for f in os.listdir(VIDEOS_DIR):
@@ -334,30 +437,63 @@ def stream_info(video_id):
             fpath = os.path.join(VIDEOS_DIR, f)
             if os.path.getsize(fpath) <= 0:
                 continue
-            if ext == ".m4a":
+            fallback_is_dash = True
+            if _is_audio_file(f):
                 if fallback_audio_path is None:
                     fallback_audio_path = fpath
             elif fallback_video_path is None:
                 fallback_video_path = fpath
+        if fallback_is_dash:
+            result["is_dash"] = True
         if fallback_video_path:
             result["has_video"] = True
             result["video_size"] = os.path.getsize(fallback_video_path)
+            v_ext = os.path.splitext(fallback_video_path)[1]
+            fmt_id = _parse_format_id(os.path.basename(fallback_video_path))
             mime, _ = mimetypes.guess_type(fallback_video_path)
-            if mime and mime.startswith("audio/"):
-                mime = "video/mp4"
-            result["video_mime"] = mime or 'video/mp4'
+            if fallback_is_dash and fmt_id:
+                codec_map = {
+                    "137": "avc1.640028", "136": "avc1.4d401f", "135": "avc1.4d401e",
+                    "298": "avc1.4d4020", "299": "avc1.640028",
+                    "247": "vp9", "248": "vp9", "302": "vp9", "303": "vp9",
+                    "308": "vp9", "335": "vp9", "336": "vp9",
+                }
+                codec = codec_map.get(fmt_id)
+                if codec:
+                    result["video_mime"] = _build_mime(codec) or (mime or 'video/webm')
+                else:
+                    result["video_mime"] = mime or 'video/webm'
+            else:
+                if mime and mime.startswith("audio/"):
+                    mime = "video/mp4"
+                result["video_mime"] = mime or 'video/webm'
+            result["init_video"] = _init_segment_size(fallback_video_path)
             dur = _mvhd_duration(fallback_video_path)
             result["duration"] = dur or 0
         if fallback_audio_path:
             result["has_audio"] = True
-            result["audio_mime"] = 'audio/mp4; codecs="mp4a.40.2"'
             result["audio_size"] = os.path.getsize(fallback_audio_path)
+            fmt_id = _parse_format_id(os.path.basename(fallback_audio_path))
+            if fallback_is_dash and fmt_id:
+                codec_map = {
+                    "139": "mp4a.40.2", "140": "mp4a.40.2", "141": "mp4a.40.2",
+                    "249": "opus", "250": "opus", "251": "opus",
+                    "255": "mp4a.40.2", "256": "mp4a.40.2", "258": "mp4a.40.2",
+                }
+                codec = codec_map.get(fmt_id, "mp4a.40.2")
+                result["audio_mime"] = _build_mime(codec) or f'audio/mp4; codecs="{codec}"'
+            else:
+                result["audio_mime"] = 'audio/mp4; codecs="mp4a.40.2"'
 
     return result
 
 
 def _mvhd_duration(path):
-    """Parse moov box to extract mvhd duration in seconds."""
+    """Parse moov box to extract mvhd duration in seconds.
+    For WebM files, parse Info > Duration from EBML."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".webm":
+        return _webm_duration(path)
     with open(path, 'rb') as f:
         f.seek(0, 2)
         file_size = f.tell()
@@ -407,9 +543,71 @@ def _mvhd_duration(path):
             pos += size
     return None
 
+def _webm_duration(path):
+    """Parse WebM/EBML to extract Duration from Segment > Info."""
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return None
+    if file_size < 12:
+        return None
+    with open(path, 'rb') as f:
+        pos = 0
+        in_segment = False
+        while pos + 4 <= file_size:
+            f.seek(pos)
+            chunk = f.read(4)
+            if len(chunk) < 4:
+                break
+            if chunk == b'\x18\x53\x80\x67':
+                pos += 4
+                _, _ = _ebml_read_vint(f)
+                in_segment = True
+                continue
+            if not in_segment:
+                pos += 1
+                continue
+            if chunk == b'\x15\x49\xa9\x66':
+                pos += 4
+                info_size, _ = _ebml_read_vint(f)
+                if info_size is None or info_size <= 0:
+                    break
+                info_end = f.tell() + info_size
+                while f.tell() + 2 <= info_end:
+                    child_id = f.read(1)[0]
+                    if child_id == 0:
+                        break
+                    id_len = _ebml_vint_size(child_id)
+                    if id_len == 2:
+                        extra = f.read(1)
+                        if len(extra) < 1:
+                            break
+                        child_id = (child_id << 8) | extra[0]
+                    elif id_len != 1:
+                        f.seek(f.tell() + id_len - 1)
+                    if child_id == 0x4489:
+                        val, val_len = _ebml_read_vint(f)
+                        if val is None:
+                            break
+                        timescale = 1000000000
+                        default_duration = val / timescale
+                        return default_duration
+                    else:
+                        dsize, dlen = _ebml_read_vint(f)
+                        if dsize is None:
+                            break
+                        f.seek(f.tell() + dsize)
+                break
+            pos += 1
+    return None
+
 
 def _last_complete_fragment_end(path, start_scan=0):
-    """Scan from start_scan, find byte offset at end of last complete moof+mdat pair."""
+    """Scan from start_scan, find byte offset at end of last complete moof+mdat pair.
+    For WebM files, scans for complete Cluster elements."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".webm":
+        return _webm_last_cluster_end(path, start_scan)
     with open(path, 'rb') as f:
         f.seek(0, 2)
         file_size = f.tell()
@@ -443,6 +641,35 @@ def _last_complete_fragment_end(path, start_scan=0):
             else:
                 f.seek(box_end)
         return last_good
+
+def _webm_last_cluster_end(path, start_scan):
+    """For WebM files, scan for complete Cluster elements.
+    Returns byte offset after the last fully written Cluster."""
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        return start_scan
+    last_good = start_scan
+    with open(path, 'rb') as f:
+        pos = start_scan
+        while pos < file_size:
+            f.seek(pos)
+            chunk = f.read(4)
+            if len(chunk) < 4:
+                break
+            if chunk == b'\x1f\x43\xb6\x75':
+                f.seek(pos + 4)
+                cluster_size, _ = _ebml_read_vint(f)
+                if cluster_size is None or cluster_size == 0:
+                    break
+                cluster_end = pos + 4 + f.tell() - (pos + 4) + cluster_size
+                if cluster_end > file_size:
+                    break
+                last_good = cluster_end
+                pos = cluster_end
+            else:
+                pos += 1
+    return last_good
 
 
 def stream_video_chunks(video_id):
@@ -510,25 +737,46 @@ def stream_diag(video_id):
     return jsonify(result)
 
 
+def _find_init_video_file(video_id):
+    """Find a DASH .f* video file for init segment, skipping audio files and too-small files."""
+    for f in os.listdir(VIDEOS_DIR):
+        name, ext = os.path.splitext(f)
+        if ext not in VIDEO_EXTS or ".f" not in name or name.split(".")[0] != video_id:
+            continue
+        fpath = os.path.join(VIDEOS_DIR, f)
+        if os.path.getsize(fpath) < MIN_VIDEO_SIZE or _is_audio_file(f):
+            continue
+        return fpath
+    return None
+
 def stream_init_segment(video_id):
-    """Serve init segment directly from the DASH .f{fmt}.mp4 file,
+    """Serve init segment directly from a DASH .f{fmt} video file,
     bypassing get_video_path() which may switch to merged file."""
+    path = None
     actives = tasks.get_active_tasks()
     for t in actives.values():
         if t["video_id"] == video_id and t.get("dash_video_fmt"):
             fmt = t["dash_video_fmt"]
-            path = os.path.join(VIDEOS_DIR, f"{video_id}.f{fmt}.mp4")
-            if not os.path.exists(path):
-                return Response(status=404)
-            init_size = _init_segment_size(path)
-            if init_size is None or init_size <= 0:
-                return Response(status=204)
-            with open(path, "rb") as f:
-                data = f.read(init_size)
-            return Response(data, status=200, mimetype="video/mp4",
-                            headers={"X-Init-Size": str(init_size),
-                                     "Content-Length": str(len(data))})
-    return Response(status=404)
+            target = f"{video_id}.f{fmt}"
+            for f in os.listdir(VIDEOS_DIR):
+                name, ext = os.path.splitext(f)
+                if name == target and ext in VIDEO_EXTS:
+                    path = os.path.join(VIDEOS_DIR, f)
+                    break
+            break
+    if not path:
+        path = _find_init_video_file(video_id)
+    if not path or not os.path.exists(path):
+        return Response(status=404)
+    init_size = _init_segment_size(path)
+    if init_size is None or init_size <= 0:
+        return Response(status=204)
+    with open(path, "rb") as f:
+        data = f.read(init_size)
+    mime = "video/webm" if path.endswith(".webm") else "video/mp4"
+    return Response(data, status=200, mimetype=mime,
+                    headers={"X-Init-Size": str(init_size),
+                             "Content-Length": str(len(data))})
 
 
 def get_thumbnail(video_id):

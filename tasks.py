@@ -90,14 +90,12 @@ def remove_task(task_id):
     _save()
 
 def mark_interrupted():
+    """Mark active tasks as interrupted (app crash). Preserve percent for resume display."""
     tasks = _load()
-    now = time.time()
     changed = False
     for tid, t in tasks.items():
-        if t.get("status") in ("downloading", "queued", "processing"):
+        if t.get("status") in ("downloading", "queued", "processing", "starting"):
             t["status"] = "interrupted"
-            t["percent"] = t.get("percent", 0)
-            t["completed_at"] = now
             changed = True
     if changed:
         _tasks_cache = tasks
@@ -107,8 +105,8 @@ def cleanup_orphaned():
     tasks = _load()
     to_remove = []
     for tid, t in tasks.items():
-        if t.get("status") in ("done", "error", "interrupted", "removed"):
-            age = time.time() - t.get("completed_at", 0)
+        if t.get("status") in ("done", "error", "removed"):
+            age = time.time() - t.get("completed_at", 0) if t.get("completed_at") else 0
             if age > 86400:
                 to_remove.append(tid)
     for tid in to_remove:

@@ -11,27 +11,18 @@
 </div>
 
 <div id="results" class="video-grid"></div>
-<div id="format-modal" class="modal hidden">
+<div id="progress-modal" class="modal hidden" style="z-index:1001">
   <div class="modal-content">
-    <span class="close" onclick="closeModal()">&times;</span>
-    <h2 id="modal-title">Select Format</h2>
-    <div id="modal-formats"></div>
-    <div id="modal-subs"></div>
-    <button id="download-btn" onclick="startDownload()" disabled>Download</button>
-    <div id="progress" class="hidden">
-      <div class="progress-bar"><div id="progress-fill"></div></div>
-      <p id="progress-text"></p>
-    </div>
+    <span class="close" onclick="document.getElementById('progress-modal').classList.add('hidden')">&times;</span>
+    <h2>Downloading</h2>
+    <div><div class="progress-bar"><div id="modal-progress-fill" style="width:0%"></div></div></div>
+    <p id="modal-progress-text"></p>
   </div>
 </div>
 
-<script>
-let selectedVideoId = null;
-let selectedFormatId = null;
-let selectedTitle = '';
-let selectedThumb = '';
-let selectedFormatLabel = '';
+{% include "_format_modal.html" %}
 
+<script>
 document.getElementById('query').addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
 
 async function search() {
@@ -56,106 +47,6 @@ async function search() {
       <div class="info"><h3>${v.title}</h3><p class="channel">${v.channel || ''}</p></div>`;
     grid.appendChild(card);
   }
-}
-
-function showFormats(videoId, title, thumb) {
-  selectedVideoId = videoId;
-  selectedTitle = title;
-  selectedThumb = thumb;
-  selectedFormatId = null;
-  selectedFormatLabel = '';
-  document.getElementById('modal-title').textContent = title;
-  document.getElementById('modal-formats').innerHTML = '<p class="loading">Loading formats...</p>';
-  document.getElementById('modal-subs').innerHTML = '';
-  document.getElementById('download-btn').disabled = true;
-  document.getElementById('progress').classList.add('hidden');
-  document.getElementById('format-modal').classList.remove('hidden');
-
-  fetch('/api/formats/' + videoId).then(r => r.json()).then(data => {
-    if (data.error) { document.getElementById('modal-formats').innerHTML = '<p class="error">' + data.error + '</p>'; return; }
-    const formatsEl = document.getElementById('modal-formats');
-    formatsEl.innerHTML = '<h3>Video Formats</h3>';
-    data.formats.forEach(f => {
-      const div = document.createElement('div');
-      div.className = 'format-option' + (f.hdr !== 'SDR' ? ' hdr' : '');
-      div.onclick = () => {
-        document.querySelectorAll('.format-option').forEach(el => el.classList.remove('selected'));
-        div.classList.add('selected');
-        selectedFormatId = f.format_id;
-        selectedFormatLabel = f.height + 'p' + (f.hdr !== 'SDR' ? ' ' + f.hdr : '');
-        document.getElementById('download-btn').disabled = false;
-      };
-      const size = f.filesize ? (f.filesize / 1024 / 1024).toFixed(1) + ' MB' : 'unknown';
-      const hdrBadge = f.hdr !== 'SDR' ? `<span class="hdr-badge">${f.hdr}</span>` : '';
-      const progressiveBadge = f.progressive ? `<span class="prog-badge" title="Can play while downloading">Play as it downloads</span>` : '';
-      div.innerHTML = `${hdrBadge} <strong>${f.height}p</strong> ${f.fps ? f.fps + 'fps' : ''} ${f.ext} ${f.vcodec ? '(' + f.vcodec.split('.')[0] + ')' : ''} ${progressiveBadge}<span class="size">${size}</span>`;
-      formatsEl.appendChild(div);
-    });
-    if (data.subtitles && Object.keys(data.subtitles).length > 0) {
-      document.getElementById('modal-subs').innerHTML = '<h3>Subtitles Available</h3><p class="sub-note">' + Object.keys(data.subtitles).join(', ') + ' (will download automatically)</p>';
-    }
-  });
-}
-
-function closeModal() {
-  document.getElementById('format-modal').classList.add('hidden');
-}
-
-async function startDownload() {
-  if (!selectedVideoId || !selectedFormatId) return;
-  document.getElementById('download-btn').disabled = true;
-  document.getElementById('progress').classList.remove('hidden');
-  document.getElementById('progress-fill').style.width = '0%';
-  document.getElementById('progress-text').textContent = 'Starting...';
-
-  const res = await fetch('/api/download', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      video_id: selectedVideoId,
-      format_id: selectedFormatId,
-      title: selectedTitle,
-      thumbnail: selectedThumb,
-      format_label: selectedFormatLabel
-    })
-  });
-  const data = await res.json();
-  if (data.status !== 'started') {
-    document.getElementById('progress-text').textContent = 'Error: could not start';
-    return;
-  }
-  const taskId = data.task_id;
-
-  // Now show progress in the modal AND the global drawer
-  // User can close the modal and still see progress in the navbar/downloads panel
-  document.getElementById('progress-text').textContent = 'Download started - see progress in toolbar ↑';
-
-  // Poll for completion to auto-redirect
-  const poll = setInterval(async () => {
-    const r = await fetch('/api/progress/' + taskId);
-    const evt = await r.json();
-    const fill = document.getElementById('progress-fill');
-    const text = document.getElementById('progress-text');
-    if (evt.status === 'not_found' || !evt.status) {
-      clearInterval(poll);
-      text.textContent = 'Download complete!';
-      setTimeout(() => { window.location.href = '/'; }, 1500);
-      return;
-    }
-    const pct = evt.percent || 0;
-    fill.style.width = pct + '%';
-    if (evt.status === 'done') {
-      clearInterval(poll);
-      fill.style.width = '100%';
-      text.textContent = 'Done! Video added to library.';
-      setTimeout(() => { window.location.href = '/'; }, 2000);
-    } else if (evt.status === 'error') {
-      clearInterval(poll);
-      text.textContent = 'Error: ' + (evt.error || 'unknown');
-    } else {
-      text.textContent = evt.status + '... ' + pct + '% (see toolbar ↑)';
-    }
-  }, 1500);
 }
 </script>
 {% endblock %}

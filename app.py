@@ -18,13 +18,91 @@ dlna_server = None
 tasks.mark_interrupted()
 tasks.cleanup_orphaned()
 
+
+def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id):
+    """Build a progress listener closure for a download task."""
+    def listener(evt):
+        status = evt.get("status")
+        if status == "starting":
+            metadata.add_video({
+                "id": video_id, "title": title, "duration": 0, "channel": "",
+                "description": "", "thumbnail": thumbnail if thumbnail.startswith("/") else thumbnail,
+                "subtitles": [], "format_label": format_label, "format_id": format_id,
+            })
+            tasks.update_task(task_id, status="starting")
+        elif status == "downloading":
+            dash_video = evt.get("dash_video_fmt")
+            dash_audio = evt.get("dash_audio_fmt")
+            tasks.update_task(task_id, status="downloading", percent=evt.get("percent"),
+                              speed=evt.get("speed"), eta=evt.get("eta"),
+                              dash_video_fmt=dash_video, dash_audio_fmt=dash_audio)
+            metadata.add_video({
+                "id": video_id, "title": title, "duration": 0, "channel": "",
+                "description": "", "thumbnail": thumbnail if thumbnail.startswith("/") else thumbnail,
+                "subtitles": [], "format_label": format_label, "format_id": format_id,
+            })
+        elif status == "processing":
+            tasks.update_task(task_id, status="processing", percent=100)
+        elif status == "paused":
+            tasks.update_task(task_id, status="paused")
+        elif status == "done":
+            info = evt.get("info", {})
+            subtitle_list = []
+            for f_name in evt.get("subtitles", []):
+                stem = os.path.splitext(f_name)[0]
+                if stem.startswith(video_id):
+                    lang = stem[len(video_id):].lstrip("._-")
+                else:
+                    lang = stem.rsplit("_", 1)[-1]
+                subtitle_list.append({"lang": lang, "file": f_name})
+            thumb_url = f"/thumb/{info['id']}" if evt.get("thumbnail") else ""
+            metadata.add_video({
+                "id": info["id"], "title": info.get("title", "Unknown"),
+                "duration": info.get("duration", 0), "channel": info.get("channel", "Unknown"),
+                "description": info.get("description", ""), "thumbnail": thumb_url,
+                "subtitles": subtitle_list, "format_label": format_label, "format_id": format_id,
+            })
+            tasks.complete_task(task_id)
+        elif status == "error":
+            tasks.fail_task(task_id, evt.get("error", "Unknown error"))
+            metadata.add_video({
+                "id": video_id, "title": title, "duration": 0, "channel": "",
+                "description": "", "thumbnail": thumbnail if thumbnail.startswith("/") else thumbnail,
+                "subtitles": [], "format_label": format_label, "format_id": format_id,
+                "error": evt.get("error", "Unknown error"),
+            })
+    return listener
+
+
+def resume_pending_tasks():
+    """Re-launch downloads for tasks interrupted by app crash."""
+    for tid, t in tasks.get_active_tasks().items():
+        if t.get("status") == "interrupted":
+            vid = t["video_id"]
+            fmt = t.get("format_id")
+            if not vid or not fmt:
+                continue
+            listener = _make_listener(tid, vid, t.get("title", vid),
+                                      t.get("thumbnail", ""),
+                                      t.get("format_label", fmt), fmt)
+            downloader.progress_listeners[tid] = listener
+            downloader.download_video(vid, fmt, tid, resume=True)
+
+
 @app.route("/")
 def index():
     vids = metadata.load_metadata()
     actives = tasks.get_active_tasks()
-    for t in actives.values():
+    paused = {}
+    downloading = {}
+    for tid, t in actives.items():
         t["has_partial"] = downloader.partial_file_exists(t["video_id"])
-    return render_template("index.html", videos=vids, active_tasks=actives, hostname=SERVER_NAME)
+        if t.get("status") == "paused":
+            paused[tid] = t
+        else:
+            downloading[tid] = t
+    return render_template("index.html", videos=vids, active_tasks=downloading,
+                           paused_tasks=paused, hostname=SERVER_NAME)
 
 @app.route("/search")
 def search():
@@ -70,38 +148,7 @@ def api_download():
     tasks.create_task(task_id, video_id, title, thumbnail, format_id, format_label)
     tasks.update_task(task_id, status="queued")
 
-    def listener(evt):
-        status = evt.get("status")
-        if status == "downloading":
-            dash_video = evt.get("dash_video_fmt")
-            dash_audio = evt.get("dash_audio_fmt")
-            tasks.update_task(task_id, status="downloading", percent=evt.get("percent"), speed=evt.get("speed"), eta=evt.get("eta"),
-                              dash_video_fmt=dash_video, dash_audio_fmt=dash_audio)
-        elif status == "processing":
-            tasks.update_task(task_id, status="processing", percent=100)
-        elif status == "done":
-            info = evt.get("info", {})
-            subtitle_list = []
-            for f_name in evt.get("subtitles", []):
-                lang = os.path.splitext(f_name)[0].rsplit("_", 1)[-1]
-                if "_" not in f_name:
-                    stem = f_name.rsplit(".", 2)
-                    lang = stem[1] if len(stem) >= 3 else lang
-                subtitle_list.append({"lang": lang, "file": f_name})
-            thumb_url = f"/thumb/{info['id']}" if evt.get("thumbnail") else ""
-            metadata.add_video({
-                "id": info["id"],
-                "title": info.get("title", "Unknown"),
-                "duration": info.get("duration", 0),
-                "channel": info.get("channel", "Unknown"),
-                "description": info.get("description", ""),
-                "thumbnail": thumb_url,
-                "subtitles": subtitle_list,
-            })
-            tasks.complete_task(task_id)
-        elif status == "error":
-            tasks.fail_task(task_id, evt.get("error", "Unknown error"))
-
+    listener = _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
     downloader.progress_listeners[task_id] = listener
     downloader.download_video(video_id, format_id, task_id)
     return jsonify({"task_id": task_id, "status": "started"})
@@ -130,6 +177,29 @@ def api_cancel_task(task_id):
     downloader.cancel_flags[task_id] = True
     downloader.progress_listeners.pop(task_id, None)
     return jsonify({"ok": True})
+
+@app.route("/api/active-tasks/<task_id>/pause", methods=["POST"])
+def api_pause_task(task_id):
+    t = tasks.get_task(task_id)
+    if not t:
+        return jsonify({"error": "Task not found"}), 404
+    downloader.pause_download(task_id)
+    return jsonify({"ok": True, "status": "pausing"})
+
+@app.route("/api/active-tasks/<task_id>/resume", methods=["POST"])
+def api_resume_task(task_id):
+    t = tasks.get_task(task_id)
+    if not t:
+        return jsonify({"error": "Task not found"}), 404
+    vid = t["video_id"]
+    fmt = t["format_id"]
+    title = t.get("title", vid)
+    thumb = t.get("thumbnail", "")
+    fmt_label = t.get("format_label", fmt)
+    listener = _make_listener(task_id, vid, title, thumb, fmt_label, fmt)
+    downloader.progress_listeners[task_id] = listener
+    downloader.resume_download(task_id, vid, fmt)
+    return jsonify({"ok": True, "status": "resuming"})
 
 @app.route("/api/library")
 def api_library():
@@ -170,27 +240,14 @@ def api_delete(video_id):
 
 @app.route("/video/<video_id>")
 def player(video_id):
-    from streamer import get_video_path
-    from config import VIDEOS_DIR
     vid = metadata.get_video(video_id)
     if vid:
-        return render_template("player.html", video=vid, is_partial=False)
+        has_partial = downloader.partial_file_exists(video_id)
+        return render_template("player.html", video=vid, is_partial=has_partial)
     active = tasks.get_active_tasks()
     is_downloading = any(t["video_id"] == video_id for t in active.values())
-    if is_downloading and downloader.partial_file_exists(video_id):
-        # Prefer DASH intermediate file when an active DASH download exists
-        dash_path = None
-        for t in active.values():
-            if t["video_id"] == video_id and t.get("dash_video_fmt"):
-                c = os.path.join(VIDEOS_DIR, f"{video_id}.f{t['dash_video_fmt']}.mp4")
-                if os.path.exists(c):
-                    dash_path = c
-                    break
-        if dash_path:
-            is_partial = True
-        else:
-            stream_path = get_video_path(video_id)
-            is_partial = stream_path and ".f" in os.path.basename(stream_path)
+    if is_downloading:
+        has_partial = downloader.partial_file_exists(video_id)
         return render_template("player.html", video={
             "id": video_id,
             "title": "Download in Progress",
@@ -198,7 +255,7 @@ def player(video_id):
             "duration": 0,
             "description": "",
             "subtitles": [],
-        }, is_partial=is_partial)
+        }, is_partial=has_partial)
     return "Video not found", 404
 
 @app.route("/stream/<video_id>")
@@ -224,6 +281,13 @@ def api_init_segment(video_id):
 @app.route("/api/diag/<video_id>")
 def api_diag(video_id):
     return stream_diag(video_id)
+
+@app.route("/api/subtitles/<video_id>")
+def api_subtitles(video_id):
+    vid = metadata.get_video(video_id)
+    if vid and vid.get("subtitles"):
+        return jsonify(vid["subtitles"])
+    return jsonify([])
 
 @app.route("/sub/<video_id>/<lang>")
 def sub(video_id, lang):
@@ -265,6 +329,9 @@ def dlna_status():
         "port": DLNA_PORT,
         "ip": None,
     })
+
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    resume_pending_tasks()
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, debug=True, threaded=True)

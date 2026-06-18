@@ -18,6 +18,7 @@
     <div class="meta-row">
       <span class="channel">{{ video.channel }}</span>
       <span class="duration">{{ video.duration // 60 }}:{{ '%02d' % (video.duration % 60) }}</span>
+      <button class="btn" onclick="showFormats(VIDEO_ID, document.querySelector('.video-meta h2').textContent, '/thumb/' + VIDEO_ID)">Download</button>
       <button class="btn-danger" onclick="deleteVideo()">Delete</button>
     </div>
     {% if video.description %}
@@ -173,22 +174,21 @@ async function initMSE(info) {
 
 async function pollChunks(sb, ms, offset) {
   while (mseActive) {
-    await sleep(3000);
-
     try {
       if (sb.updating) {
         await new Promise(function(r) { sb.addEventListener('updateend', r, { once: true }); });
       }
 
       var resp = await fetch('/api/video-chunks/' + VIDEO_ID + '?after=' + offset);
-      if (resp.status === 204) continue;
+      if (resp.status === 204) { await sleep(3000); continue; }
 
       var chunkEnd = parseInt(resp.headers.get('X-Chunk-End'));
-      if (chunkEnd <= offset) continue;
+      if (chunkEnd <= offset) { await sleep(3000); continue; }
 
       var data = await resp.arrayBuffer();
       await appendToBuffer(sb, data);
       offset = chunkEnd;
+      videoEl.play()['catch'](function() {});
     } catch (e) {
       if (e.sourceBufferError) {
         console.error('SourceBuffer error in pollChunks, falling back');
@@ -261,18 +261,29 @@ async function initPlayer() {
     return;
   }
 
-  if (info.is_dash && info.has_video && info.video_mime && info.init_video &&
-      typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(info.video_mime)) {
-    initMSE(info);
+  if (info.is_dash) {
+    if (info.has_video && info.video_mime && info.init_video &&
+        typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(info.video_mime)) {
+      initMSE(info);
+      return;
+    }
+    // Init not ready yet — poll for MSE
+    if (!info.init_video) {
+      waitForMSE(info);
+      return;
+    }
+    // MSE not supported with this codec — fallback to direct stream + audio
+    if (info.has_video) {
+      videoEl.src = '/stream/' + VIDEO_ID;
+    }
+    if (info.has_audio && info.audio_mime) {
+      tryAudio();
+    }
+    showRefreshButton();
     return;
   }
 
-  // DASH partial but init segment not ready yet - poll until it is
-  if (info.is_dash && !info.is_done && !info.has_video && info.has_audio) {
-    waitForMSE(info);
-    return;
-  }
-
+  // Non-DASH partial (progressive download)
   if (info.has_video) {
     videoEl.src = '/stream/' + VIDEO_ID;
   }
@@ -302,6 +313,14 @@ async function waitForMSE(info) {
         initMSE(updated);
         return;
       }
+      // Init is ready but MSE not supported — fallback to direct stream
+      if (updated.init_video) {
+        if (updated.has_video) {
+          videoEl.src = '/stream/' + VIDEO_ID;
+        }
+        showRefreshButton();
+        return;
+      }
     } catch (e) {}
     if (attempts > 30) {
       showRefreshButton();
@@ -317,4 +336,6 @@ function deleteVideo() {
   fetch('/api/library/{{ video.id }}', {method: 'DELETE'}).then(function() { window.location.href = '/'; });
 }
 </script>
+
+{% include "_format_modal.html" %}
 {% endblock %}

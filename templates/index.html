@@ -3,6 +3,7 @@
 {% block content %}
 
 {% set active_tasks = active_tasks or {} %}
+{% set paused_tasks = paused_tasks or {} %}
 
 {% if active_tasks %}
 <div class="header-bar">
@@ -28,6 +29,39 @@
       {% if task.get('has_partial') %}
       <button class="btn-play-inline" onclick="window.location.href='/video/{{ task.video_id }}'" title="Play partial video">Play</button>
       {% endif %}
+      {% if task.status not in ('processing', 'error') %}
+      <button class="btn-pause-inline" onclick="pauseDownload('{{ tid }}')">Pause</button>
+      {% endif %}
+      <button class="btn-cancel" onclick="cancelDownload('{{ tid }}')">&times;</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if paused_tasks %}
+<div class="header-bar" style="margin-top:8px">
+  <h1>Paused</h1>
+  <span class="count">{{ paused_tasks|length }} paused</span>
+  <button class="btn-resume-all" onclick="resumeAllPaused()">Resume All</button>
+</div>
+<div class="tasks-container" id="paused-tasks">
+  {% for tid, task in paused_tasks.items() %}
+  <div class="task-card paused" data-task-id="{{ tid }}">
+    <div class="task-thumb">
+      <img src="{{ task.thumbnail }}" alt="" onerror="this.style.display='none'">
+    </div>
+    <div class="task-info">
+      <h3>{{ task.title }}</h3>
+      <p class="task-meta">{{ task.format_label }}</p>
+      <div class="progress-bar"><div class="progress-fill" style="width: {{ task.percent }}%"></div></div>
+      <p class="task-status">
+        <span class="status-text paused-text">paused</span>
+        <span class="task-pct">{{ task.percent }}%</span>
+      </p>
+    </div>
+    <div class="task-actions">
+      <button class="btn-pause-inline" onclick="resumeDownload('{{ tid }}')">Resume</button>
       <button class="btn-cancel" onclick="cancelDownload('{{ tid }}')">&times;</button>
     </div>
   </div>
@@ -49,14 +83,18 @@
 
 <div class="video-grid">
   {% for v in videos %}
-  <a href="/video/{{ v.id }}" class="video-card">
+  <a href="/video/{{ v.id }}" class="video-card{% if v.get('error') %} errored{% endif %}">
     <div class="thumb">
       <img src="/thumb/{{ v.id }}" alt="" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22320%22 height=%22180%22><rect fill=%22%23333%22 width=%22320%22 height=%22180%22/><text fill=%22%23666%22 x=%22160%22 y=%2290%22 text-anchor=%22middle%22>No Thumb</text></svg>'">
+      {% if v.get('error') %}
+      <div class="error-overlay">Failed</div>
+      {% else %}
       <span class="duration">{{ v.duration // 60 }}:{{ '%02d' % (v.duration % 60) }}</span>
+      {% endif %}
     </div>
     <div class="info">
       <h3>{{ v.title }}</h3>
-      <p class="channel">{{ v.channel }}</p>
+      <p class="channel">{{ v.channel }}{% if v.get('format_label') %} &middot; {{ v.format_label }}{% endif %}</p>
     </div>
   </a>
   {% endfor %}
@@ -64,25 +102,53 @@
 
 <script>
 function pollActiveTasks() {
-  const container = document.getElementById('active-tasks');
-  if (!container || !container.children.length) return;
   fetch('/api/active-tasks')
     .then(r => r.json())
     .then(tasks => {
-      for (const t of tasks) {
-        const el = container.querySelector('[data-task-id="' + t.task_id + '"]');
-        if (!el) { location.reload(); return; }
-        const fill = el.querySelector('.progress-fill');
-        const pct = el.querySelector('.task-pct');
-        const status = el.querySelector('.status-text');
-        if (fill) fill.style.width = (t.percent || 0) + '%';
-        if (pct) pct.textContent = (t.percent || 0) + '%';
-        if (status) status.textContent = t.status;
-        if (t.status === 'done' || t.status === 'error') {
-          setTimeout(() => location.reload(), 1500);
+      // Update downloading tasks
+      const activeContainer = document.getElementById('active-tasks');
+      if (activeContainer && activeContainer.children.length) {
+        for (const t of tasks) {
+          if (t.status === 'paused') continue;
+          const el = activeContainer.querySelector('[data-task-id="' + t.task_id + '"]');
+          if (!el) { location.reload(); return; }
+          const fill = el.querySelector('.progress-fill');
+          const pct = el.querySelector('.task-pct');
+          const status = el.querySelector('.status-text');
+          if (fill) fill.style.width = (t.percent || 0) + '%';
+          if (pct) pct.textContent = (t.percent || 0) + '%';
+          if (status) status.textContent = t.status;
+          if (t.status === 'done' || t.status === 'error') {
+            setTimeout(() => location.reload(), 1500);
+          }
+        }
+      }
+      // Update paused tasks
+      const pausedContainer = document.getElementById('paused-tasks');
+      if (pausedContainer) {
+        for (const t of tasks) {
+          if (t.status !== 'paused') continue;
+          const el = pausedContainer.querySelector('[data-task-id="' + t.task_id + '"]');
+          if (el) {
+            const fill = el.querySelector('.progress-fill');
+            const pct = el.querySelector('.task-pct');
+            if (fill) fill.style.width = (t.percent || 0) + '%';
+            if (pct) pct.textContent = (t.percent || 0) + '%';
+          }
         }
       }
     });
+}
+
+async function resumeAllPaused() {
+  const pausedContainer = document.getElementById('paused-tasks');
+  if (!pausedContainer) return;
+  const buttons = pausedContainer.querySelectorAll('.btn-pause-inline');
+  for (const btn of buttons) {
+    // Extract task_id from onclick attribute
+    const match = btn.getAttribute('onclick').match(/resumeDownload\('([^']+)'\)/);
+    if (match) await resumeDownload(match[1]);
+  }
 }
 
 setInterval(pollActiveTasks, 2000);
