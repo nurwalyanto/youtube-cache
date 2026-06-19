@@ -1,4 +1,28 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
+
+.url-input-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 24px; background: #1a1a1a;
+  padding: 12px 16px; border-radius: 8px; border: 1px solid #333;
+}
+.url-input-bar input {
+  flex: 1; background: #111; border: 1px solid #444;
+  color: #eee; padding: 10px 14px; border-radius: 6px;
+  font-size: 1em; outline: none;
+}
+.url-input-bar input:focus { border-color: #ff4444; }
+.url-input-bar button {
+  background: #ff4444; color: #fff; border: none;
+  padding: 10px 20px; border-radius: 6px; font-weight: 600;
+  cursor: pointer; white-space: nowrap;
+}
+.url-input-bar button:hover { background: #e33; }
+.url-input-bar button:disabled { opacity: .5; cursor: default; }
+.url-error {
+  color: #ff6b6b; font-size: 0.85em; white-space: nowrap;
+  flex: 0 0 100%; margin-top: 4px;
+}
+.url-error.hidden { display: none; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   background: #0a0a0a; color: #eee; min-height: 100vh;
@@ -239,3 +263,12 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 }
 .dl-task-status { font-size: 0.8em; color: #aaa; }
 .dl-task-status.status-paused { color: #ffaa00; }
+
+.subs-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.sub-pill {
+  display: inline-block; padding: 4px 10px; border-radius: 4px;
+  font-size: 0.8em; cursor: pointer; user-select: none;
+  background: #444; color: #888; transition: .15s;
+}
+.sub-pill.selected { background: #2a6b2a; color: #8f8; }
+.sub-pill:hover { filter: brightness(1.2); }

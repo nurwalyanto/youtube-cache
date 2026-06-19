@@ -2,6 +2,12 @@
 {% block title %}Library - YouTube Cache{% endblock %}
 {% block content %}
 
+<div class="url-input-bar">
+  <input type="text" id="url-input" placeholder="Paste YouTube URL here..." onkeydown="if(event.key==='Enter')downloadByUrl()">
+  <button onclick="downloadByUrl()">Download</button>
+  <span id="url-error" class="url-error hidden"></span>
+</div>
+
 {% set active_tasks = active_tasks or {} %}
 {% set paused_tasks = paused_tasks or {} %}
 
@@ -152,5 +158,51 @@ async function resumeAllPaused() {
 }
 
 setInterval(pollActiveTasks, 2000);
+
+function extractVideoId(input) {
+  input = input.trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
+  var m = input.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+  if (m) return m[1];
+  m = input.match(/youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)([a-zA-Z0-9_-]{11})/);
+  if (m) return m[1];
+  return null;
+}
+
+function downloadByUrl() {
+  var input = document.getElementById('url-input').value;
+  var errorEl = document.getElementById('url-error');
+  var btn = errorEl.nextElementSibling || document.querySelector('.url-input-bar button');
+  var videoId = extractVideoId(input);
+  if (!videoId) {
+    errorEl.textContent = 'Could not find a valid YouTube video ID in that URL.';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+  errorEl.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Loading...';
+  fetch('/api/video-info/' + videoId)
+    .then(function(r) { return r.json(); })
+    .then(function(info) {
+      if (info.error) {
+        errorEl.textContent = info.error;
+        errorEl.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Download';
+        return;
+      }
+      btn.disabled = false;
+      btn.textContent = 'Download';
+      showFormats(info.id, info.title, info.thumbnail);
+    })
+    .catch(function(err) {
+      errorEl.textContent = 'Network error: ' + err.message;
+      errorEl.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = 'Download';
+    });
+}
 </script>
+{% include "_format_modal.html" %}
 {% endblock %}

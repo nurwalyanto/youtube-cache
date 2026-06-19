@@ -17,24 +17,29 @@ Self-hosted YouTube video caching server with play-while-downloading, web UI, an
 ## Requirements
 
 - Python 3.9+
-- ffmpeg (for DASH merge)
+- ffmpeg (for DASH merge; must be in PATH on Windows)
 - A browser with MSE support (Chrome, Firefox, Edge, Safari)
 
 ## Quick Start
 
-```bash
-# Clone and enter the project
-cd youtube-cache
+### Linux / macOS
 
-# Create virtual environment
+```bash
+cd youtube-cache
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Start the server
 python3 app.py
+```
+
+### Windows (PowerShell)
+
+```powershell
+cd youtube-cache
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
 ```
 
 Open http://localhost:5000 in your browser.
