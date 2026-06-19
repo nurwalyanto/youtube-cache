@@ -342,7 +342,7 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
         if not resume:
             old_meta = meta_module.get_video(video_id)
 
-            # Skip re-download if same format already has a valid merged file
+            # Skip re-download if same format already has a valid merged file or DASH files
             if old_meta and old_meta.get("format_id") == format_id:
                 merged = None
                 for f in os.listdir(VIDEOS_DIR):
@@ -358,6 +358,23 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                     if task_id and task_id in progress_listeners:
                         progress_listeners[task_id]({"status": "done",
                             "video_path": merged, "subtitles": subtitle_files,
+                            "thumbnail": thumbnail_path, "info": old_meta})
+                    return
+                # Check for completed DASH files (no merge)
+                dash_found = False
+                for f in os.listdir(VIDEOS_DIR):
+                    name, ext = os.path.splitext(f)
+                    if ext not in VIDEO_EXTS:
+                        continue
+                    if ".f" in name and name.split(".")[0] == video_id:
+                        dash_found = True
+                        break
+                if dash_found:
+                    subtitle_files = _find_subtitle_files(video_id)
+                    thumbnail_path = _find_thumbnail_file(video_id)
+                    if task_id and task_id in progress_listeners:
+                        progress_listeners[task_id]({"status": "done",
+                            "video_path": None, "subtitles": subtitle_files,
                             "thumbnail": thumbnail_path, "info": old_meta})
                     return
 
@@ -506,42 +523,16 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                 if task_id and task_id in progress_listeners:
                     progress_listeners[task_id]({"status": "processing", "percent": 100})
 
-                # Merge with ffmpeg
-                import subprocess
-                v_path = _find_dash_video(video_id, dash_video_fmt)
-                if not v_path or not os.path.exists(v_path):
-                    raise Exception(f"Video file not found for merge, checked .mp4 and .webm")
-                a_path = _find_dash_audio(video_id, dash_audio_fmt)
-                if not a_path or not os.path.exists(a_path):
-                    a_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_audio_fmt}.m4a")
-                    if not os.path.exists(a_path):
-                        a_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_audio_fmt}.mp4")
-                    if not os.path.exists(a_path):
-                        a_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_audio_fmt}.webm")
-                if not os.path.exists(a_path):
-                    raise Exception(f"Audio file not found for merge, checked multiple paths")
-                v_ext = os.path.splitext(v_path)[1]
-                merged_ext = "webm" if v_ext == ".webm" else "mp4"
-                merged = os.path.join(VIDEOS_DIR, f"{info_pre['id']}.{merged_ext}")
-                ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy"]
-                if merged_ext == "mp4":
-                    ffmpeg_args += ["-movflags", "+faststart"]
-                ffmpeg_args.append(merged)
-                result = subprocess.run(ffmpeg_args, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise Exception(f"FFmpeg merge failed: {result.stderr[:500]}")
-                for p in [v_path, a_path]:
-                    try: os.remove(p)
-                    except: pass
-
+                # No ffmpeg merge — keep DASH files on disk, HLS serves them directly
                 actual_id = info_pre["id"]
                 subtitle_files = _find_subtitle_files(actual_id)
                 thumbnail_path = _find_thumbnail_file(actual_id)
+                v_path = _find_dash_video(video_id, dash_video_fmt)
 
                 if task_id and task_id in progress_listeners:
                     progress_listeners[task_id]({
                         "status": "done",
-                        "video_path": merged,
+                        "video_path": v_path,
                         "subtitles": subtitle_files,
                         "thumbnail": thumbnail_path,
                         "info": {

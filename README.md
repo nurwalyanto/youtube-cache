@@ -17,8 +17,8 @@ Self-hosted YouTube video caching server with play-while-downloading, web UI, an
 ## Requirements
 
 - Python 3.9+
-- ffmpeg (for DASH merge; must be in PATH on Windows)
-- A browser with MSE support (Chrome, Firefox, Edge, Safari)
+- ffmpeg (for HLS segment generation; must be in PATH)
+- A browser with HLS support via hls.js (Chrome, Firefox, Edge) or native (Safari, iOS)
 
 ## Quick Start
 
@@ -88,40 +88,45 @@ The browser must be closed when the download starts (cookies file is locked whil
 
 ```
 Browser  ──▶  Flask App (port 5000)
-                 │
-                 ├── yt-dlp ──▶ YouTube
-                 │                  │
-                 │            ┌─────┴─────┐
-                 │            │ Video .f* │  Audio .f*
-                 │            │ (fMP4)    │  (.m4a)
-                 │            └─────┬─────┘
-                 │                  │
-                 │            ffmpeg merge
-                 │                  │
-                 │            ┌─────┘
-                 │            │ merged .mp4
-                 │            │
-                 ├── Streamer ──▶ HTTP range-request video/audio
-                 │
-                 ├── DLNA server (port 5001) ──▶ TV / Console
-                 │
-                 └── Tasks ──▶ Persistent download state
+                  │
+                  ├── yt-dlp ──▶ YouTube
+                  │                  │
+                  │            ┌─────┴─────┐
+                  │            │ Video .f* │  Audio .f*
+                  │            │ (webm/mp4)│  (.m4a)
+                  │            └─────┬─────┘
+                  │                  │
+                  │            ┌─────┘
+                  │            ▼
+                  │      FFmpeg (on-demand, per-segment)
+                  │      -c copy (no re-encode)
+                  │            │
+                  │            ▼
+                  │      /run/shm/yt-cache/{id}/
+                  │      init.mp4 + seg_0000.m4s + ...
+                  │            │
+                  ├── HLS serve ──▶ hls.js / ExoPlayer (single stream)
+                  │
+                  ├── HTTP range ──▶ progressive files / DLNA
+                  │
+                  ├── DLNA server (port 5001) ──▶ TV / Console
+                  │
+                  └── Tasks ──▶ Persistent download state
 ```
 
 ### Play-While-Downloading
 
 **DASH formats** (high quality, separate video+audio):
-1. Two concurrent yt-dlp threads download video (fMP4) and audio (M4A)
+1. Two concurrent yt-dlp threads download video (WebM/fMP4) and audio (M4A)
 2. Both files grow simultaneously
-3. MSE (Media Source Extensions) feeds video fragments to the browser as they arrive
-4. Audio plays separately via `<audio>` element, synced to video
-5. The seek bar expands as the download progresses
-6. On completion, ffmpeg merges video+audio into a single MP4
-7. The player seamlessly switches to the merged file
+3. On first viewer request, FFmpeg generates muxed HLS segments on-demand
+4. hls.js feeds segments to the browser as they become available
+5. Single `<video>` element — no separate audio tracking
+6. Segments are cached in tmpfs for fast subsequent access
+7. On completion, final segments are generated and playlist is finalized
 
 **Progressive formats** (single file with audio+video):
 1. The file streams directly via HTTP range requests
-2. A "Refresh seek range" button lets you expand the seekable area
 3. On completion, the player auto-reloads with the full file
 
 ### DLNA
@@ -142,12 +147,12 @@ Start DLNA from the web UI: the server broadcasts your library as a UPnP media s
 | `/api/active-tasks/<id>` | DELETE | Cancel a download |
 | `/api/library` | GET | Library contents |
 | `/api/library/<id>` | DELETE | Remove a video |
-| `/api/stream-info/<id>` | GET | Streaming metadata (codecs, sizes, MSE info) |
-| `/api/init-segment/<id>` | GET | MSE init segment for DASH playback |
-| `/api/video-chunks/<id>` | GET | Completed fMP4 fragments for MSE |
-| `/api/diag/<id>` | GET | Diagnostic info for debugging |
-| `/stream/<id>` | GET | Video stream (range-request) |
-| `/stream_audio/<id>` | GET | DASH audio stream |
+| `/api/stream-info/<id>` | GET | Streaming status (is_done, hls_ready, has_merged, etc.) |
+| `/api/hls/<id>/master.m3u8` | GET | HLS master playlist |
+| `/api/hls/<id>/init.mp4` | GET | HLS init segment (for fMP4 mode) |
+| `/api/hls/<id>/seg_NNNN.m4s` | GET | Individual HLS media segment (generated on demand) |
+| `/stream/<id>` | GET | Direct video stream (range-request, for progressive files) |
+| `/stream_audio/<id>` | GET | DASH audio stream (fallback only) |
 | `/video/<id>` | GET | Player page |
 | `/api/dlna/start` | POST | Start DLNA server |
 | `/api/dlna/stop` | POST | Stop DLNA server |
@@ -160,7 +165,8 @@ youtube-cache/
 ├── app.py              # Flask application, routes
 ├── config.py           # Paths and server configuration
 ├── downloader.py       # yt-dlp wrapper, search, format listing
-├── streamer.py         # HTTP streaming, MSE support, codec handling
+├── streamer.py         # HTTP streaming, HLS serving, subtitle/thumbnail
+├── hls_manager.py      # FFmpeg HLS segment generation and cache management
 ├── metadata.py         # Video library metadata store
 ├── tasks.py            # Persistent download task management
 ├── dlna_server.py      # UPnP/DLNA media server

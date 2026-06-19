@@ -2,15 +2,25 @@ import os
 import json
 import threading
 import time
-from flask import Flask, render_template, request, jsonify, Response, send_file
+from flask import Flask, render_template, request, jsonify, Response, send_file, abort
 
 from config import (
     VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, PORT, DLNA_PORT, HOST, SERVER_NAME
 )
+
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+os.makedirs(SUBTITLES_DIR, exist_ok=True)
+os.makedirs(THUMBNAILS_DIR, exist_ok=True)
+
 import metadata
 import downloader
 import tasks
-from streamer import stream_video, stream_audio_track, stream_video_chunks, stream_info, stream_init_segment, stream_diag, get_subtitle, get_thumbnail
+from streamer import (
+    stream_video, stream_audio_track, get_subtitle, get_thumbnail,
+    hls_master_playlist, hls_serve_file,
+    stream_status,
+)
+import hls_manager
 
 app = Flask(__name__)
 dlna_server = None
@@ -244,17 +254,19 @@ def api_delete(video_id):
     for f in os.listdir(THUMBNAILS_DIR):
         if os.path.splitext(f)[0] == video_id:
             os.remove(os.path.join(THUMBNAILS_DIR, f))
+    hls_manager.clear(video_id)
     metadata.remove_video(video_id)
     return jsonify({"ok": True})
 
 @app.route("/video/<video_id>")
 def player(video_id):
+    active = tasks.get_active_tasks()
+    is_downloading = any(t["video_id"] == video_id for t in active.values())
     vid = metadata.get_video(video_id)
     if vid:
         has_partial = downloader.partial_file_exists(video_id)
-        return render_template("player.html", video=vid, is_partial=has_partial)
-    active = tasks.get_active_tasks()
-    is_downloading = any(t["video_id"] == video_id for t in active.values())
+        return render_template("player.html", video=vid, is_partial=has_partial,
+                               is_downloading=is_downloading)
     if is_downloading:
         has_partial = downloader.partial_file_exists(video_id)
         return render_template("player.html", video={
@@ -264,7 +276,7 @@ def player(video_id):
             "duration": 0,
             "description": "",
             "subtitles": [],
-        }, is_partial=has_partial)
+        }, is_partial=has_partial, is_downloading=True)
     return "Video not found", 404
 
 @app.route("/stream/<video_id>")
@@ -275,21 +287,21 @@ def video_stream(video_id):
 def audio_stream(video_id):
     return stream_audio_track(video_id)
 
-@app.route("/api/video-chunks/<video_id>")
-def api_video_chunks(video_id):
-    return stream_video_chunks(video_id)
+@app.route("/api/hls/<video_id>/master.m3u8")
+def api_hls_master(video_id):
+    body, content_type = hls_master_playlist(video_id)
+    if body is None:
+        return Response(status=204)
+    return Response(body, mimetype=content_type or "application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-cache"})
+
+@app.route("/api/hls/<video_id>/<path:filename>")
+def api_hls_file(video_id, filename):
+    return hls_serve_file(video_id, filename)
 
 @app.route("/api/stream-info/<video_id>")
 def api_stream_info(video_id):
-    return jsonify(stream_info(video_id))
-
-@app.route("/api/init-segment/<video_id>")
-def api_init_segment(video_id):
-    return stream_init_segment(video_id)
-
-@app.route("/api/diag/<video_id>")
-def api_diag(video_id):
-    return stream_diag(video_id)
+    return jsonify(stream_status(video_id))
 
 @app.route("/api/subtitles/<video_id>")
 def api_subtitles(video_id):
