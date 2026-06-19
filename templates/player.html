@@ -70,15 +70,26 @@ function copyLink() {
     var url = info.has_merged
       ? window.location.origin + '/stream/' + VIDEO_ID
       : window.location.origin + '/api/hls/' + VIDEO_ID + '/master.m3u8';
-    navigator.clipboard.writeText(url)['catch'](function() {
-      var inp = document.createElement('input');
-      inp.value = url;
-      document.body.appendChild(inp);
-      inp.select();
-      document.execCommand('copy');
-      document.body.removeChild(inp);
-    });
+    var inp = document.getElementById('copy-url-input');
+    inp.value = url;
+    document.getElementById('copy-overlay').classList.remove('hidden');
+    setTimeout(function() { inp.focus(); inp.select(); }, 100);
   });
+}
+
+function doCopyUrl() {
+  var inp = document.getElementById('copy-url-input');
+  inp.select();
+  inp.setSelectionRange(0, inp.value.length);
+  if (document.execCommand('copy')) {
+    var btn = document.querySelector('#copy-overlay .btn');
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 2000);
+  }
+}
+
+function closeCopyOverlay() {
+  document.getElementById('copy-overlay').classList.add('hidden');
 }
 
 function loadHls() {
@@ -131,6 +142,17 @@ function deleteVideo() {
   fetch('/api/library/{{ video.id }}', {method: 'DELETE'}).then(function() { window.location.href = '/'; });
 }
 </script>
+
+<div id="copy-overlay" class="modal hidden">
+  <div class="modal-content" style="text-align:center">
+    <h3>Copy Link</h3>
+    <input id="copy-url-input" readonly
+      style="width:100%;padding:10px;background:#222;color:#fff;border:1px solid #555;border-radius:4px;margin:12px 0;font-size:0.85em">
+    <button class="btn" onclick="doCopyUrl()" style="border:none;cursor:pointer">Copy</button>
+    <button class="btn-danger" onclick="closeCopyOverlay()" style="margin-left:8px;border:none;cursor:pointer">Close</button>
+    <p style="color:#888;font-size:0.8em;margin-top:8px">Or tap the input and copy manually</p>
+  </div>
+</div>
 
 {% include "_format_modal.html" %}
 {% endblock %}
