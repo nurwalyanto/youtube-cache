@@ -10,6 +10,8 @@ import tasks
 
 FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
+MIN_VIDEO_SIZE = 102400
+
 progress_listeners = {}
 cancel_flags = {}
 pause_flags = {}
@@ -360,7 +362,6 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                             "video_path": merged, "subtitles": subtitle_files,
                             "thumbnail": thumbnail_path, "info": old_meta})
                     return
-                # Check for completed DASH files (no merge)
                 dash_found = False
                 for f in os.listdir(VIDEOS_DIR):
                     name, ext = os.path.splitext(f)
@@ -370,12 +371,59 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                         dash_found = True
                         break
                 if dash_found:
+                    # Remove any small/broken merged file that might interfere
+                    for f in os.listdir(VIDEOS_DIR):
+                        name, ext = os.path.splitext(f)
+                        if name == video_id and ext in VIDEO_EXTS:
+                            fp = os.path.join(VIDEOS_DIR, f)
+                            if os.path.getsize(fp) < MIN_VIDEO_SIZE:
+                                try: os.remove(fp)
+                                except: pass
+                    # Merge existing DASH files
+                    v_path = a_path = None
+                    for f in os.listdir(VIDEOS_DIR):
+                        name, ext = os.path.splitext(f)
+                        if ext not in VIDEO_EXTS or ".f" not in name or name.split(".")[0] != video_id:
+                            continue
+                        full = os.path.join(VIDEOS_DIR, f)
+                        if os.path.getsize(full) < MIN_VIDEO_SIZE:
+                            continue
+                        if ext == ".m4a":
+                            a_path = full
+                        elif not v_path:
+                            v_path = full
+                    merged_path = None
+                    if v_path and a_path:
+                        import subprocess
+                        v_ext = os.path.splitext(v_path)[1]
+                        a_ext = os.path.splitext(a_path)[1]
+                        if v_ext == ".webm":
+                            merged_ext = "webm"
+                            ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c:v", "copy"]
+                            if a_ext == ".m4a":
+                                ffmpeg_args += ["-c:a", "libopus"]
+                            else:
+                                ffmpeg_args += ["-c:a", "copy"]
+                        else:
+                            merged_ext = "mp4"
+                            ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy",
+                                           "-movflags", "+faststart"]
+                        merged = os.path.join(VIDEOS_DIR, f"{video_id}.{merged_ext}")
+                        ffmpeg_args.append(merged)
+                        result = subprocess.run(ffmpeg_args, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            for p in [v_path, a_path]:
+                                try: os.remove(p)
+                                except: pass
+                            merged_path = merged
                     subtitle_files = _find_subtitle_files(video_id)
                     thumbnail_path = _find_thumbnail_file(video_id)
                     if task_id and task_id in progress_listeners:
                         progress_listeners[task_id]({"status": "done",
-                            "video_path": None, "subtitles": subtitle_files,
-                            "thumbnail": thumbnail_path, "info": old_meta})
+                            "video_path": merged_path,
+                            "subtitles": subtitle_files,
+                            "thumbnail": thumbnail_path,
+                            "info": old_meta})
                     return
 
             # Check if partial files exist from a failed download of the same format
@@ -537,11 +585,19 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                 if not os.path.exists(a_path):
                     raise Exception(f"Audio file not found for merge, checked multiple paths")
                 v_ext = os.path.splitext(v_path)[1]
-                merged_ext = "webm" if v_ext == ".webm" else "mp4"
+                a_ext = os.path.splitext(a_path)[1]
+                if v_ext == ".webm":
+                    merged_ext = "webm"
+                    ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c:v", "copy"]
+                    if a_ext == ".m4a":
+                        ffmpeg_args += ["-c:a", "libopus"]
+                    else:
+                        ffmpeg_args += ["-c:a", "copy"]
+                else:
+                    merged_ext = "mp4"
+                    ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy",
+                                   "-movflags", "+faststart"]
                 merged = os.path.join(VIDEOS_DIR, f"{info_pre['id']}.{merged_ext}")
-                ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy"]
-                if merged_ext == "mp4":
-                    ffmpeg_args += ["-movflags", "+faststart"]
                 ffmpeg_args.append(merged)
                 result = subprocess.run(ffmpeg_args, capture_output=True, text=True)
                 if result.returncode != 0:

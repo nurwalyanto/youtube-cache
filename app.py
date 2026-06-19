@@ -139,7 +139,9 @@ def api_formats(video_id):
     try:
         formats = downloader.list_formats(video_id)
         subs = downloader.list_subtitles(video_id)
-        return jsonify({"formats": formats, "subtitles": subs})
+        vid = metadata.get_video(video_id)
+        current_fmt = vid.get("format_id") if vid else None
+        return jsonify({"formats": formats, "subtitles": subs, "current_format_id": current_fmt})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

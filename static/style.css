@@ -114,6 +114,12 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .format-option.selected { background: #ff444422; border: 1px solid #ff4444; }
 .format-option.hdr { border-left: 3px solid #ff8800; }
 .size { color: #888; font-size: 0.85em; float: right; }
+.format-option.current { border: 1px solid #22c55e; background: #1a3a1a; }
+.current-badge {
+  display: inline-block; background: #22c55e; color: #000;
+  padding: 1px 6px; border-radius: 3px; font-size: 0.75em; font-weight: 700;
+  margin-right: 6px;
+}
 .hdr-badge {
   display: inline-block; background: #ff8800; color: #000;
   padding: 1px 6px; border-radius: 3px; font-size: 0.75em; font-weight: 700;

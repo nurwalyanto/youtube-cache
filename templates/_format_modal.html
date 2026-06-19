@@ -80,7 +80,11 @@ function showFormats(videoId, title, thumb) {
       const size = f.filesize ? (f.filesize / 1024 / 1024).toFixed(1) + ' MB' : 'unknown';
       const hdrBadge = f.hdr !== 'SDR' ? `<span class="hdr-badge">${f.hdr}</span>` : '';
       const progressiveBadge = f.progressive ? `<span class="prog-badge" title="Can play while downloading">Play as it downloads</span>` : '';
-      div.innerHTML = `${hdrBadge} <strong>${f.height}p</strong> ${f.fps ? f.fps + 'fps' : ''} ${f.ext} ${f.vcodec ? '(' + f.vcodec.split('.')[0] + ')' : ''} ${progressiveBadge}<span class="size">${size}</span>`;
+      const currentBadge = f.format_id === data.current_format_id ? `<span class="current-badge">✓ Current</span>` : '';
+      div.innerHTML = `${currentBadge}${hdrBadge} <strong>${f.height}p</strong> ${f.fps ? f.fps + 'fps' : ''} ${f.ext} ${f.vcodec ? '(' + f.vcodec.split('.')[0] + ')' : ''} ${progressiveBadge}<span class="size">${size}</span>`;
+      if (f.format_id === data.current_format_id) {
+        div.classList.add('current');
+      }
       formatsEl.appendChild(div);
     });
     if (data.subtitles && Object.keys(data.subtitles).length > 0) {
