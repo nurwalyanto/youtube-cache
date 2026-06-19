@@ -78,6 +78,7 @@
 <div class="header-bar">
   <h1>Your Library</h1>
   <span class="count">{{ videos|length }} video{% if videos|length != 1 %}s{% endif %}</span>
+  <a href="/rss" class="rss-link" title="RSS Feed">RSS</a>
 </div>
 
 {% if not videos and not active_tasks %}

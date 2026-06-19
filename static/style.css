@@ -44,6 +44,8 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 }
 .header-bar h1 { font-size: 1.5em; font-weight: 600; }
 .count { color: #888; font-size: 0.9em; }
+.rss-link { margin-left: auto; color: #ff8c00; font-size: 0.85em; font-weight: 600; text-decoration: none; padding: 2px 8px; border: 1px solid #ff8c00; border-radius: 4px; }
+.rss-link:hover { background: #ff8c00; color: #000; }
 .empty-state { text-align: center; padding: 60px 20px; color: #666; }
 .empty-state p { margin-bottom: 16px; font-size: 1.1em; }
 .btn {

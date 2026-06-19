@@ -2,6 +2,9 @@ import os
 import json
 import threading
 import time
+import xml.etree.ElementTree as ET
+import mimetypes
+from email import utils
 from flask import Flask, render_template, request, jsonify, Response, send_file, abort
 
 from config import (
@@ -18,7 +21,7 @@ import tasks
 from streamer import (
     stream_video, stream_audio_track, get_subtitle, get_thumbnail,
     hls_master_playlist, hls_serve_file,
-    stream_status,
+    stream_status, get_video_path,
 )
 import hls_manager
 
@@ -304,6 +307,52 @@ def api_hls_file(video_id, filename):
 @app.route("/api/stream-info/<video_id>")
 def api_stream_info(video_id):
     return jsonify(stream_status(video_id))
+
+
+@app.route("/rss")
+def rss_feed():
+    ET.register_namespace("atom", "http://www.w3.org/2005/Atom")
+    ET.register_namespace("media", "http://search.yahoo.com/mrss/")
+    rss = ET.Element("rss", version="2.0")
+    ch = ET.SubElement(rss, "channel")
+    ET.SubElement(ch, "title").text = "YouTube Cache"
+    ET.SubElement(ch, "link").text = request.host_url
+    ET.SubElement(ch, "description").text = "Downloaded YouTube videos"
+
+    atom_link = ET.SubElement(ch, "{http://www.w3.org/2005/Atom}link")
+    atom_link.set("href", request.host_url.rstrip("/") + "/rss")
+    atom_link.set("rel", "self")
+    atom_link.set("type", "application/rss+xml")
+
+    for v in metadata.load_metadata():
+        path = get_video_path(v["id"], exact_only=True)
+        if not path:
+            continue
+        mime, _ = mimetypes.guess_type(path)
+        size = os.path.getsize(path)
+        mtime = os.path.getmtime(path)
+
+        item = ET.SubElement(ch, "item")
+        ET.SubElement(item, "title").text = v.get("title", "Unknown")
+        ET.SubElement(item, "link").text = request.host_url.rstrip("/") + f"/video/{v['id']}"
+        ET.SubElement(item, "guid").text = v["id"]
+        ET.SubElement(item, "pubDate").text = utils.formatdate(mtime, usegmt=True)
+
+        desc = v.get("description", "") or v.get("channel", "")
+        ET.SubElement(item, "description").text = desc
+
+        enc = ET.SubElement(item, "enclosure")
+        enc.set("url", request.host_url.rstrip("/") + f"/stream/{v['id']}")
+        enc.set("type", mime or "video/mp4")
+        enc.set("length", str(size))
+
+        thumb = ET.SubElement(item, "{http://search.yahoo.com/mrss/}thumbnail")
+        thumb.set("url", request.host_url.rstrip("/") + f"/thumb/{v['id']}")
+
+    return Response(
+        ET.tostring(rss, encoding="unicode", xml_declaration=True),
+        mimetype="application/rss+xml",
+    )
 
 @app.route("/api/subtitles/<video_id>")
 def api_subtitles(video_id):
