@@ -100,7 +100,10 @@ def ensure_init(video_id, video_path, audio_path):
             return False
         for name in list(os.listdir(tmpdir)):
             if name.startswith(".init_"):
-                os.remove(os.path.join(tmpdir, name))
+                try:
+                    os.remove(os.path.join(tmpdir, name))
+                except (OSError, PermissionError):
+                    pass
         return True
     except:
         return False
@@ -138,7 +141,10 @@ def _generate_all_segments(video_id, video_path, audio_path, seg_type):
             continue
         path = os.path.join(vdir, name)
         if name.startswith("seg_") and name.endswith(f".{ext}"):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except (OSError, PermissionError):
+                pass
 
     fmt = "fmp4" if seg_type == "fmp4" else "mpegts"
     cmd = [FFMPEG_PATH, "-y"]
@@ -358,7 +364,10 @@ def invalidate(video_id):
         return
     for name in os.listdir(vdir):
         if name.startswith("seg_") or name in ("meta.json", "master.m3u8"):
-            os.remove(os.path.join(vdir, name))
+            try:
+                os.remove(os.path.join(vdir, name))
+            except (OSError, PermissionError):
+                pass
 
 
 def clear(video_id):

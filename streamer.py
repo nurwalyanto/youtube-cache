@@ -131,7 +131,10 @@ def _ensure_hls_init(video_id):
     v_path, a_path = _get_dash_paths(video_id)
     if not v_path:
         return None, None
-    hls_manager.initialize(video_id, v_path, a_path)
+    try:
+        hls_manager.initialize(video_id, v_path, a_path)
+    except Exception:
+        return None, None
     return v_path, a_path
 
 
@@ -145,7 +148,10 @@ def _seed_segments(video_id, v_path, a_path):
     new_count = 0
     n = 0
     while n < 1000:
-        path, dur, st = hls_manager.get_or_create_segment(video_id, v_path, a_path, n)
+        try:
+            path, dur, st = hls_manager.get_or_create_segment(video_id, v_path, a_path, n)
+        except Exception:
+            break
         if path is None:
             break
         if n >= existing:
@@ -179,10 +185,13 @@ def hls_master_playlist(video_id):
 def hls_serve_file(video_id, filename):
     """Serve a file from HLS cache. Generates on-demand if needed."""
     if filename == "master.m3u8":
-        v_path, a_path = _ensure_hls_init(video_id)
-        if not v_path:
+        try:
+            v_path, a_path = _ensure_hls_init(video_id)
+            if not v_path:
+                abort(404)
+            _seed_segments(video_id, v_path, a_path)
+        except Exception:
             abort(404)
-        _seed_segments(video_id, v_path, a_path)
         playlist = hls_manager.build_playlist(
             video_id,
             include_endlist=hls_manager.is_playlist_complete(video_id),
