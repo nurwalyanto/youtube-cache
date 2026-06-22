@@ -206,7 +206,10 @@ def hls_serve_file(video_id, filename):
         abort(404)
 
     if filename == "init.mp4":
-        ok = hls_manager.ensure_init(video_id, v_path, a_path)
+        try:
+            ok = hls_manager.ensure_init(video_id, v_path, a_path)
+        except Exception:
+            abort(404)
         if not ok:
             abort(404)
         path = os.path.join(hls_manager.video_dir(video_id), "init.mp4")
@@ -219,7 +222,10 @@ def hls_serve_file(video_id, filename):
         abort(404)
     n = int(m.group(1))
 
-    path, duration, seg_type = hls_manager.get_or_create_segment(video_id, v_path, a_path, n)
+    try:
+        path, duration, seg_type = hls_manager.get_or_create_segment(video_id, v_path, a_path, n)
+    except Exception:
+        abort(404)
     if path is None:
         abort(404)
 

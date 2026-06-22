@@ -32,6 +32,31 @@ tasks.mark_interrupted()
 tasks.cleanup_orphaned()
 
 
+def _start_next_queued():
+    """Start the next queued download, if any."""
+    if tasks.has_active_download():
+        return
+    queue = tasks.get_queue()
+    while queue:
+        next_tid = queue[0]
+        t = tasks.get_task(next_tid)
+        if not t:
+            tasks.dequeue_task(next_tid)
+            queue = tasks.get_queue()
+            continue
+        tasks.dequeue_task(next_tid)
+        vid = t["video_id"]
+        fmt = t["format_id"]
+        title = t.get("title", vid)
+        thumb = t.get("thumbnail", "")
+        fmt_label = t.get("format_label", fmt)
+        subtitle_langs = t.get("subtitle_langs")
+        listener = _make_listener(next_tid, vid, title, thumb, fmt_label, fmt)
+        downloader.progress_listeners[next_tid] = listener
+        downloader.download_video(vid, fmt, next_tid, subtitle_langs=subtitle_langs)
+        break
+
+
 def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id):
     """Build a progress listener closure for a download task."""
     def listener(evt):
@@ -57,7 +82,10 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
         elif status == "processing":
             tasks.update_task(task_id, status="processing", percent=100)
         elif status == "paused":
-            tasks.update_task(task_id, status="paused")
+            cur = tasks.get_task(task_id)
+            if cur and cur.get("status") != "queued":
+                tasks.update_task(task_id, status="paused")
+                _start_next_queued()
         elif status == "done":
             info = evt.get("info", {})
             subtitle_list = []
@@ -76,6 +104,7 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
                 "subtitles": subtitle_list, "format_label": format_label, "format_id": format_id,
             })
             tasks.complete_task(task_id)
+            _start_next_queued()
         elif status == "error":
             tasks.fail_task(task_id, evt.get("error", "Unknown error"))
             metadata.add_video({
@@ -84,22 +113,38 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
                 "subtitles": [], "format_label": format_label, "format_id": format_id,
                 "error": evt.get("error", "Unknown error"),
             })
+            _start_next_queued()
     return listener
 
 
 def resume_pending_tasks():
-    """Re-launch downloads for tasks interrupted by app crash."""
-    for tid, t in tasks.get_active_tasks().items():
+    """Re-launch interrupted tasks: start first, queue the rest."""
+    tasks.clear_queue()
+    interrupted = []
+    for tid, t in list(tasks.get_active_tasks().items()):
         if t.get("status") == "interrupted":
             vid = t["video_id"]
             fmt = t.get("format_id")
             if not vid or not fmt:
                 continue
-            listener = _make_listener(tid, vid, t.get("title", vid),
-                                      t.get("thumbnail", ""),
-                                      t.get("format_label", fmt), fmt)
-            downloader.progress_listeners[tid] = listener
-            downloader.download_video(vid, fmt, tid, resume=True)
+            interrupted.append((tid, vid, fmt, t.get("title", vid),
+                                t.get("thumbnail", ""), t.get("format_label", fmt)))
+
+    if not interrupted:
+        return
+
+    # Start the first one immediately
+    tid, vid, fmt, title, thumb, fmt_label = interrupted[0]
+    listener = _make_listener(tid, vid, title, thumb, fmt_label, fmt)
+    downloader.progress_listeners[tid] = listener
+    downloader.download_video(vid, fmt, tid, resume=True)
+
+    # Queue the rest
+    for tid, vid, fmt, title, thumb, fmt_label in interrupted[1:]:
+        tasks.update_task(tid, status="queued")
+        tasks.queue_task(tid)
+        listener = _make_listener(tid, vid, title, thumb, fmt_label, fmt)
+        downloader.progress_listeners[tid] = listener
 
 
 @app.route("/")
@@ -168,14 +213,61 @@ def api_download():
     if not video_id or not format_id:
         return jsonify({"error": "Missing video_id or format_id"}), 400
 
+    # Check for existing non-error task for this video
+    existing_tid = None
+    existing_task = None
+    for tid, t in tasks.get_active_tasks().items():
+        if t["video_id"] == video_id and t.get("status") != "error":
+            existing_tid = tid
+            existing_task = t
+            break
+
+    if existing_task:
+        status = existing_task.get("status")
+        tid = existing_tid
+
+        # downloading/processing → pause
+        if status in ("downloading", "processing"):
+            tasks.update_task(tid, subtitle_langs=subtitle_langs, status="paused")
+            downloader.pause_download(tid)
+            return jsonify({"task_id": tid, "status": "paused"})
+
+        # queued → force-download (pause current active, start this)
+        if status == "queued":
+            tasks.dequeue_task(tid)
+            tasks.update_task(tid, subtitle_langs=subtitle_langs)
+            active_tid = tasks.get_active_download_task_id()
+            if active_tid:
+                tasks.update_task(active_tid, status="queued")
+                tasks.queue_task_front(active_tid)
+                downloader.pause_download(active_tid)
+            listener = _make_listener(tid, video_id, title, thumbnail, format_label, format_id)
+            downloader.progress_listeners[tid] = listener
+            downloader.download_video(video_id, format_id, tid, subtitle_langs=subtitle_langs)
+            return jsonify({"task_id": tid, "status": "started"})
+
+        # paused → queue
+        if status == "paused":
+            tasks.update_task(tid, status="queued", subtitle_langs=subtitle_langs)
+            tasks.queue_task(tid)
+            listener = _make_listener(tid, video_id, title, thumbnail, format_label, format_id)
+            downloader.progress_listeners[tid] = listener
+            return jsonify({"task_id": tid, "status": "queued"})
+
+    # No existing task — create new one
     task_id = f"{video_id}_{int(time.time())}"
     tasks.create_task(task_id, video_id, title, thumbnail, format_id, format_label)
-    tasks.update_task(task_id, status="queued")
-
+    tasks.update_task(task_id, subtitle_langs=subtitle_langs)
     listener = _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
     downloader.progress_listeners[task_id] = listener
-    downloader.download_video(video_id, format_id, task_id, subtitle_langs=subtitle_langs)
-    return jsonify({"task_id": task_id, "status": "started"})
+
+    if tasks.has_active_download():
+        tasks.queue_task(task_id)
+        tasks.update_task(task_id, status="queued")
+        return jsonify({"task_id": task_id, "status": "queued"})
+    else:
+        downloader.download_video(video_id, format_id, task_id, subtitle_langs=subtitle_langs)
+        return jsonify({"task_id": task_id, "status": "started"})
 
 @app.route("/api/progress/<task_id>")
 def api_progress(task_id):
@@ -187,9 +279,12 @@ def api_progress(task_id):
 @app.route("/api/active-tasks")
 def api_active_tasks():
     actives = tasks.get_active_tasks()
+    queue_list = tasks.get_queue()
     result = []
     for t in actives.values():
         t["has_partial"] = downloader.partial_file_exists(t["video_id"])
+        if t["task_id"] in queue_list:
+            t["queue_position"] = queue_list.index(t["task_id"]) + 1
         result.append(t)
     return jsonify(result)
 
@@ -207,7 +302,15 @@ def api_pause_task(task_id):
     t = tasks.get_task(task_id)
     if not t:
         return jsonify({"error": "Task not found"}), 404
-    downloader.pause_download(task_id)
+    status = t.get("status")
+    if status in ("starting", "downloading", "processing"):
+        tasks.update_task(task_id, status="paused")
+        downloader.pause_download(task_id)
+        _start_next_queued()
+    elif status == "queued":
+        tasks.dequeue_task(task_id)
+        tasks.update_task(task_id, status="paused")
+        _start_next_queued()
     return jsonify({"ok": True, "status": "pausing"})
 
 @app.route("/api/active-tasks/<task_id>/resume", methods=["POST"])
@@ -220,6 +323,28 @@ def api_resume_task(task_id):
     title = t.get("title", vid)
     thumb = t.get("thumbnail", "")
     fmt_label = t.get("format_label", fmt)
+    subtitle_langs = t.get("subtitle_langs")
+
+    if t.get("status") == "queued":
+        tasks.dequeue_task(task_id)
+        tasks.update_task(task_id, subtitle_langs=subtitle_langs)
+        active_tid = tasks.get_active_download_task_id()
+        if active_tid:
+            tasks.update_task(active_tid, status="queued")
+            tasks.queue_task_front(active_tid)
+            downloader.pause_download(active_tid)
+        listener = _make_listener(task_id, vid, title, thumb, fmt_label, fmt)
+        downloader.progress_listeners[task_id] = listener
+        downloader.download_video(vid, fmt, task_id, subtitle_langs=subtitle_langs)
+        return jsonify({"ok": True, "status": "started"})
+
+    if tasks.has_active_download():
+        tasks.queue_task(task_id)
+        tasks.update_task(task_id, status="queued")
+        listener = _make_listener(task_id, vid, title, thumb, fmt_label, fmt)
+        downloader.progress_listeners[task_id] = listener
+        return jsonify({"ok": True, "status": "queued"})
+
     listener = _make_listener(task_id, vid, title, thumb, fmt_label, fmt)
     downloader.progress_listeners[task_id] = listener
     downloader.resume_download(task_id, vid, fmt)

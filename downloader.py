@@ -342,6 +342,14 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
         has_partials = False
 
         if not resume:
+            # Remove any existing merged file from a prior partial download
+            # that would falsely trigger the "already done" skip below
+            for f in os.listdir(VIDEOS_DIR):
+                name, ext = os.path.splitext(f)
+                if ext in VIDEO_EXTS and name == video_id and ".f" not in name:
+                    try: os.remove(os.path.join(VIDEOS_DIR, f))
+                    except: pass
+
             old_meta = meta_module.get_video(video_id)
 
             # Skip re-download if same format already has a valid merged file or DASH files

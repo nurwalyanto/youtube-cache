@@ -88,6 +88,7 @@ def remove_task(task_id):
     tasks.pop(task_id, None)
     _tasks_cache = tasks
     _save()
+    dequeue_task(task_id)
 
 def mark_interrupted():
     """Mark active tasks as interrupted (app crash). Preserve percent for resume display."""
@@ -113,3 +114,71 @@ def cleanup_orphaned():
         tasks.pop(tid, None)
     _tasks_cache = tasks
     _save()
+
+
+# ─── Download queue ─────────────────────────────────────
+
+QUEUE_FILE = os.path.join(CACHE_DIR, "download_queue.json")
+_queue_lock = Lock()
+
+def _load_queue():
+    if not os.path.exists(QUEUE_FILE):
+        return []
+    try:
+        with open(QUEUE_FILE, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except:
+        return []
+
+def _save_queue(queue):
+    with _queue_lock:
+        with open(QUEUE_FILE, "w") as f:
+            json.dump(queue, f)
+
+def queue_task(task_id):
+    """Add task to end of the download queue."""
+    queue = _load_queue()
+    if task_id not in queue:
+        queue.append(task_id)
+    _save_queue(queue)
+
+def queue_task_front(task_id):
+    """Add task to front of the download queue."""
+    queue = _load_queue()
+    if task_id not in queue:
+        queue.insert(0, task_id)
+    _save_queue(queue)
+
+def dequeue_task(task_id):
+    """Remove task from the download queue."""
+    queue = _load_queue()
+    if task_id in queue:
+        queue.remove(task_id)
+    _save_queue(queue)
+
+def get_queue():
+    """Return ordered list of queued task_ids."""
+    return _load_queue()
+
+def clear_queue():
+    """Remove all entries from the download queue."""
+    _save_queue([])
+
+def has_active_download():
+    """True if any task is actively downloading (not paused/queued/done)."""
+    tasks = _load()
+    for t in tasks.values():
+        s = t.get("status")
+        if s in ("downloading", "processing", "starting"):
+            return True
+    return False
+
+def get_active_download_task_id():
+    """Return task_id of the actively downloading task, or None."""
+    tasks = _load()
+    for tid, t in tasks.items():
+        s = t.get("status")
+        if s in ("downloading", "processing", "starting"):
+            return tid
+    return None

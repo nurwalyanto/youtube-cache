@@ -125,6 +125,16 @@ async function startDownload() {
     })
   });
   const data = await res.json();
+  if (data.status === 'queued') {
+    document.getElementById('progress-text').textContent = 'Queued — will download after current task finishes';
+    closeModal();
+    return;
+  }
+  if (data.status === 'paused') {
+    document.getElementById('progress-text').textContent = 'Download paused';
+    closeModal();
+    return;
+  }
   if (data.status !== 'started') {
     document.getElementById('progress-text').textContent = 'Error: could not start';
     return;

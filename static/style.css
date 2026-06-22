@@ -230,6 +230,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .dl-task-status { font-size: 0.7em; color: #ff8800; margin-top: 2px; }
 .dl-task-status.status-processing { color: #4488ff; }
 .dl-task-status:contains(error) { color: #ff4444; }
+.queue-badge { color: #888; font-size: 0.85em; margin-left: 4px; }
 .dl-empty { text-align: center; color: #666; padding: 40px 0; font-size: 0.9em; }
 
 @media (max-width: 600px) {
