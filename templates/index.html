@@ -101,7 +101,7 @@
     </div>
     <div class="info">
       <h3>{{ v.title }}</h3>
-      <p class="channel">{{ v.channel }}{% if v.get('format_label') %} &middot; {{ v.format_label }}{% endif %}</p>
+      <p class="channel">{{ v.channel }}{% if v.get('format_label') %} &middot; {{ v.format_label }}{% endif %}{% if v.subtitles %} &middot; {{ v.subtitles|length }} sub{% endif %}</p>
     </div>
   </a>
   {% endfor %}

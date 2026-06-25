@@ -126,6 +126,11 @@ class TestTaskState:
         td.update_task("a", status="starting")
         assert td.has_active_download() is True
 
+    def test_has_active_true_when_pausing(self, td):
+        td.create_task("a", "v1", "A", "", "f1", "720p")
+        td.update_task("a", status="pausing")
+        assert td.has_active_download() is True
+
     def test_has_active_false_when_paused(self, td):
         td.create_task("a", "v1", "A", "", "f1", "720p")
         td.update_task("a", status="paused")
@@ -139,6 +144,11 @@ class TestTaskState:
         td.create_task("a", "v1", "A", "", "f1", "720p")
         td.create_task("b", "v2", "B", "", "f1", "720p")
         td.update_task("a", status="downloading")
+        assert td.get_active_download_task_id() == "a"
+
+    def test_get_active_task_id_pausing(self, td):
+        td.create_task("a", "v1", "A", "", "f1", "720p")
+        td.update_task("a", status="pausing")
         assert td.get_active_download_task_id() == "a"
 
     def test_get_active_task_id_none(self, td):

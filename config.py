@@ -14,6 +14,8 @@ HOST = "0.0.0.0"
 PORT = 5000
 DLNA_PORT = 5001
 SERVER_NAME = "YouTube Cache"
+SUBTITLE_URL_PREFIX = "/subtitle"
+DEFAULT_SUBTITLE_LANG = "en"
 
 # HLS cache — on Windows always use disk; on Linux prefer tmpfs
 if platform.system() == "Windows":

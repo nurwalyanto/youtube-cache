@@ -2,10 +2,11 @@ import os
 import json
 import threading
 import time
+import shutil
 import xml.etree.ElementTree as ET
 import mimetypes
 from email import utils
-from flask import Flask, render_template, request, jsonify, Response, send_file, abort
+from flask import Flask, render_template, request, jsonify, Response, send_file, abort, redirect
 
 from config import (
     VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, PORT, DLNA_PORT, HOST, SERVER_NAME
@@ -18,10 +19,35 @@ os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 import metadata
 import downloader
 import tasks
+
+
+def _migrate_flat_subtitles():
+    """Move flat {video_id}_{lang}.{ext} files into organized cache/subtitles/{video_id}/{lang}.{ext}."""
+    import re
+    for f in os.listdir(SUBTITLES_DIR):
+        full = os.path.join(SUBTITLES_DIR, f)
+        if not os.path.isfile(full):
+            continue
+        name, ext = os.path.splitext(f)
+        if ext not in (".vtt", ".srt", ".ass"):
+            continue
+        # Match {video_id}_{lang} pattern (last underscore separates lang)
+        m = re.match(r"^(.+?)_([a-z]{2}(?:-[A-Za-z]+)?)$", name)
+        if not m:
+            continue
+        vid, lang = m.group(1), m.group(2)
+        target_dir = os.path.join(SUBTITLES_DIR, vid)
+        os.makedirs(target_dir, exist_ok=True)
+        dst = os.path.join(target_dir, f"{lang}{ext}")
+        if not os.path.exists(dst):
+            os.rename(full, dst)
+
+
+_migrate_flat_subtitles()
 from streamer import (
     stream_video, stream_audio_track, get_subtitle, get_thumbnail,
     hls_master_playlist, hls_serve_file,
-    stream_status, get_video_path,
+    stream_status, get_video_path, list_subtitles_on_disk,
 )
 import hls_manager
 
@@ -50,10 +76,9 @@ def _start_next_queued():
         title = t.get("title", vid)
         thumb = t.get("thumbnail", "")
         fmt_label = t.get("format_label", fmt)
-        subtitle_langs = t.get("subtitle_langs")
         listener = _make_listener(next_tid, vid, title, thumb, fmt_label, fmt)
         downloader.progress_listeners[next_tid] = listener
-        downloader.download_video(vid, fmt, next_tid, subtitle_langs=subtitle_langs)
+        downloader.download_video(vid, fmt, next_tid)
         break
 
 
@@ -113,6 +138,31 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
                 "subtitles": [], "format_label": format_label, "format_id": format_id,
                 "error": evt.get("error", "Unknown error"),
             })
+            _start_next_queued()
+    return listener
+
+
+def _make_subtitle_listener(task_id, video_id):
+    """Build a progress listener for standalone subtitle download."""
+    def listener(evt):
+        status = evt.get("status")
+        if status == "starting":
+            tasks.update_task(task_id, status="starting", percent=0)
+        elif status == "downloading":
+            tasks.update_task(task_id, status="downloading", percent=evt.get("percent", 50))
+        elif status == "processing":
+            tasks.update_task(task_id, status="processing", percent=100)
+        elif status == "done":
+            subs = evt.get("subtitles", [])
+            vid = metadata.get_video(video_id)
+            if vid:
+                subtitle_list = [{"lang": s["lang"], "file": s["file"]} for s in subs]
+                vid["subtitles"] = subtitle_list
+                metadata.add_video(vid)
+            tasks.complete_task(task_id)
+            _start_next_queued()
+        elif status == "error":
+            tasks.fail_task(task_id, evt.get("error", "Subtitle download failed"))
             _start_next_queued()
     return listener
 
@@ -209,7 +259,6 @@ def api_download():
     title = data.get("title", video_id)
     thumbnail = data.get("thumbnail", "")
     format_label = data.get("format_label", format_id)
-    subtitle_langs = data.get("subtitles")
     if not video_id or not format_id:
         return jsonify({"error": "Missing video_id or format_id"}), 400
 
@@ -226,29 +275,30 @@ def api_download():
         status = existing_task.get("status")
         tid = existing_tid
 
-        # downloading/processing → pause
-        if status in ("downloading", "processing"):
-            tasks.update_task(tid, subtitle_langs=subtitle_langs, status="paused")
+        # downloading/processing -> request pause; queued work starts only after the worker confirms.
+        if status in ("starting", "downloading", "processing"):
+            tasks.update_task(tid, status="pausing")
             downloader.pause_download(tid)
-            return jsonify({"task_id": tid, "status": "paused"})
+            return jsonify({"task_id": tid, "status": "pausing"})
 
-        # queued → force-download (pause current active, start this)
+        # queued -> promote to the front. If another worker is active, wait for its paused event.
         if status == "queued":
             tasks.dequeue_task(tid)
-            tasks.update_task(tid, subtitle_langs=subtitle_langs)
             active_tid = tasks.get_active_download_task_id()
             if active_tid:
-                tasks.update_task(active_tid, status="queued")
-                tasks.queue_task_front(active_tid)
+                tasks.update_task(active_tid, status="pausing")
+                tasks.queue_task_front(tid)
+                tasks.update_task(tid, status="queued")
                 downloader.pause_download(active_tid)
+                return jsonify({"task_id": tid, "status": "queued"})
             listener = _make_listener(tid, video_id, title, thumbnail, format_label, format_id)
             downloader.progress_listeners[tid] = listener
-            downloader.download_video(video_id, format_id, tid, subtitle_langs=subtitle_langs)
+            downloader.download_video(video_id, format_id, tid)
             return jsonify({"task_id": tid, "status": "started"})
 
         # paused → queue
         if status == "paused":
-            tasks.update_task(tid, status="queued", subtitle_langs=subtitle_langs)
+            tasks.update_task(tid, status="queued")
             tasks.queue_task(tid)
             listener = _make_listener(tid, video_id, title, thumbnail, format_label, format_id)
             downloader.progress_listeners[tid] = listener
@@ -257,7 +307,6 @@ def api_download():
     # No existing task — create new one
     task_id = f"{video_id}_{int(time.time())}"
     tasks.create_task(task_id, video_id, title, thumbnail, format_id, format_label)
-    tasks.update_task(task_id, subtitle_langs=subtitle_langs)
     listener = _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
     downloader.progress_listeners[task_id] = listener
 
@@ -266,7 +315,7 @@ def api_download():
         tasks.update_task(task_id, status="queued")
         return jsonify({"task_id": task_id, "status": "queued"})
     else:
-        downloader.download_video(video_id, format_id, task_id, subtitle_langs=subtitle_langs)
+        downloader.download_video(video_id, format_id, task_id)
         return jsonify({"task_id": task_id, "status": "started"})
 
 @app.route("/api/progress/<task_id>")
@@ -304,9 +353,8 @@ def api_pause_task(task_id):
         return jsonify({"error": "Task not found"}), 404
     status = t.get("status")
     if status in ("starting", "downloading", "processing"):
-        tasks.update_task(task_id, status="paused")
+        tasks.update_task(task_id, status="pausing")
         downloader.pause_download(task_id)
-        _start_next_queued()
     elif status == "queued":
         tasks.dequeue_task(task_id)
         tasks.update_task(task_id, status="paused")
@@ -323,19 +371,18 @@ def api_resume_task(task_id):
     title = t.get("title", vid)
     thumb = t.get("thumbnail", "")
     fmt_label = t.get("format_label", fmt)
-    subtitle_langs = t.get("subtitle_langs")
-
     if t.get("status") == "queued":
         tasks.dequeue_task(task_id)
-        tasks.update_task(task_id, subtitle_langs=subtitle_langs)
         active_tid = tasks.get_active_download_task_id()
         if active_tid:
-            tasks.update_task(active_tid, status="queued")
-            tasks.queue_task_front(active_tid)
+            tasks.update_task(active_tid, status="pausing")
+            tasks.queue_task_front(task_id)
+            tasks.update_task(task_id, status="queued")
             downloader.pause_download(active_tid)
+            return jsonify({"ok": True, "status": "queued"})
         listener = _make_listener(task_id, vid, title, thumb, fmt_label, fmt)
         downloader.progress_listeners[task_id] = listener
-        downloader.download_video(vid, fmt, task_id, subtitle_langs=subtitle_langs)
+        downloader.download_video(vid, fmt, task_id)
         return jsonify({"ok": True, "status": "started"})
 
     if tasks.has_active_download():
@@ -378,8 +425,14 @@ def api_delete(video_id):
     for f in os.listdir(VIDEOS_DIR):
         if os.path.splitext(f)[0] == video_id:
             os.remove(os.path.join(VIDEOS_DIR, f))
+    # Remove organized subtitle directory if it exists
+    sub_dir = os.path.join(SUBTITLES_DIR, video_id)
+    if os.path.isdir(sub_dir):
+        shutil.rmtree(sub_dir)
+    # Remove flat subtitle files (legacy)
     for f in os.listdir(SUBTITLES_DIR):
-        if os.path.splitext(f)[0] == video_id:
+        name, ext = os.path.splitext(f)
+        if name.startswith(video_id) and ext in (".vtt", ".srt", ".ass"):
             os.remove(os.path.join(SUBTITLES_DIR, f))
     for f in os.listdir(THUMBNAILS_DIR):
         if os.path.splitext(f)[0] == video_id:
@@ -450,7 +503,7 @@ def rss_feed():
     atom_link.set("type", "application/rss+xml")
 
     for v in metadata.load_metadata():
-        path = get_video_path(v["id"], exact_only=True)
+        path = get_video_path(v["id"], exact_only=False)
         if not path:
             continue
         mime, _ = mimetypes.guess_type(path)
@@ -474,24 +527,62 @@ def rss_feed():
         thumb = ET.SubElement(item, "{http://search.yahoo.com/mrss/}thumbnail")
         thumb.set("url", request.host_url.rstrip("/") + f"/thumb/{v['id']}")
 
+        subs = list_subtitles_on_disk(v["id"])
+        if subs:
+            langs = ",".join(s["lang"] for s in subs)
+            sub_elem = ET.SubElement(item, "subtitle")
+            sub_elem.set("langs", langs)
+            for s in subs:
+                sub_link = ET.SubElement(item, "subtitle")
+                sub_link.set("lang", s["lang"])
+                sub_link.text = request.host_url.rstrip("/") + f"/subtitle/{v['id']}/{s['lang']}"
+
     return Response(
         ET.tostring(rss, encoding="unicode", xml_declaration=True),
         mimetype="application/rss+xml",
     )
 
-@app.route("/api/subtitles/<video_id>")
-def api_subtitles(video_id):
-    vid = metadata.get_video(video_id)
-    if vid and vid.get("subtitles"):
-        return jsonify(vid["subtitles"])
-    return jsonify([])
+@app.route("/api/subtitles/<video_id>", methods=["GET"])
+def api_subtitles_list(video_id):
+    on_disk = list_subtitles_on_disk(video_id)
+    available = downloader.list_subtitles(video_id)
+    return jsonify({"on_disk": on_disk, "available": available})
 
-@app.route("/sub/<video_id>/<lang>")
-def sub(video_id, lang):
+
+@app.route("/api/subtitles/<video_id>", methods=["POST"])
+def api_subtitles_download(video_id):
+    data = request.get_json(silent=True) or {}
+    langs = data.get("langs") if data else None
+    task_id = f"sub_{video_id}_{int(time.time())}"
+    tasks.create_task(task_id, video_id, f"Subtitles for {video_id}", "", "", "")
+    url = f"https://youtube.com/watch?v={video_id}"
+
+    def run():
+        if task_id in downloader.subtitle_listeners:
+            downloader.subtitle_listeners[task_id]({"status": "starting"})
+        subs = downloader.download_all_subtitles(video_id, url, langs=langs)
+        if task_id in downloader.subtitle_listeners:
+            downloader.subtitle_listeners[task_id]({"status": "done", "subtitles": subs})
+
+    listener = _make_subtitle_listener(task_id, video_id)
+    downloader.subtitle_listeners[task_id] = listener
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return jsonify({"task_id": task_id, "status": "started"})
+
+
+@app.route("/subtitle/<video_id>/<lang>")
+def subtitle_serve(video_id, lang):
     content, mime = get_subtitle(video_id, lang)
     if content is None:
         return "Not found", 404
     return Response(content, mimetype=mime)
+
+
+@app.route("/sub/<video_id>/<lang>")
+def sub_redirect(video_id, lang):
+    return redirect(f"/subtitle/{video_id}/{lang}", 301)
+
 
 @app.route("/thumb/<video_id>")
 def thumb(video_id):

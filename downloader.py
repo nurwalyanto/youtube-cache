@@ -5,7 +5,7 @@ import time
 import threading
 import shutil
 import yt_dlp
-from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR
+from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, DEFAULT_SUBTITLE_LANG
 import tasks
 
 FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
@@ -15,9 +15,39 @@ MIN_VIDEO_SIZE = 102400
 progress_listeners = {}
 cancel_flags = {}
 pause_flags = {}
+subtitle_listeners = {}
+_run_tokens = {}
+_run_lock = threading.Lock()
 
 class PauseException(Exception):
     pass
+
+
+def _register_run(task_id):
+    if not task_id:
+        return None
+    token = object()
+    with _run_lock:
+        _run_tokens[task_id] = token
+    pause_flags.pop(task_id, None)
+    cancel_flags.pop(task_id, None)
+    return token
+
+
+def _is_current_run(task_id, token):
+    if not task_id:
+        return True
+    with _run_lock:
+        return _run_tokens.get(task_id) is token
+
+
+def _clear_run(task_id, token):
+    if not task_id:
+        return
+    with _run_lock:
+        if _run_tokens.get(task_id) is token:
+            _run_tokens.pop(task_id, None)
+
 
 def hdr_label(format_note):
     if not format_note:
@@ -89,9 +119,15 @@ def list_formats(video_id):
         except Exception as e:
             raise Exception(f"Failed to list formats: {e}")
 
-COMMON_LANGS = [
-    "en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh-Hans",
-    "zh-Hant", "ar", "hi", "nl", "pl", "sv", "da", "fi", "nb", "tr",
+# Extended language list for subtitle download — covers most manually-subtitled languages.
+# yt-dlp silently skips any language not available for a given video.
+SUBTITLE_LANGS = [
+    "en", "en-GB", "en-orig", "es", "es-419", "fr", "fr-CA", "de",
+    "it", "pt", "pt-BR", "pt-PT", "ru", "ja", "ko", "zh-Hans", "zh-Hant",
+    "ar", "hi", "nl", "pl", "sv", "da", "fi", "nb", "tr",
+    "cs", "ro", "hu", "el", "he", "th", "vi", "uk", "id", "ms",
+    "ca", "eu", "gl", "sr", "hr", "sk", "sl", "lt", "lv", "et",
+    "bg", "bn", "ta", "te", "ml", "mr", "gu",
 ]
 
 def get_video_info(video_id):
@@ -112,7 +148,7 @@ def get_video_info(video_id):
 
 def list_subtitles(video_id):
     url = f"https://youtube.com/watch?v={video_id}"
-    ydl_opts = {"quiet": True, "no_warnings": True, "writesubtitles": True, "writeautomaticsub": True}
+    ydl_opts = {"quiet": True, "no_warnings": True, "writesubtitles": True, "writeautomaticsub": True, "cookiesfrombrowser": ("firefox",)}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -123,9 +159,7 @@ def list_subtitles(video_id):
                 available[lang] = "manual"
             for lang in auto_subs:
                 if lang not in available:
-                    base = lang.split("-")[0] if "-" in lang else lang
-                    if base in COMMON_LANGS:
-                        available[lang] = "auto"
+                    available[lang] = "auto"
             return available
         except:
             return {}
@@ -218,6 +252,9 @@ def _find_thumbnail_file(video_id):
     return None
 
 def _find_subtitle_files(video_id):
+    organized = _find_organized_subtitles(video_id)
+    if organized:
+        return [e["file"] for e in organized]
     found = []
     for f in os.listdir(SUBTITLES_DIR):
         name, ext = os.path.splitext(f)
@@ -236,25 +273,71 @@ def _find_subtitle_files(video_id):
                     pass
     return found
 
-def _download_subtitles(video_id, url, subtitle_langs=None):
-    if subtitle_langs is not None and len(subtitle_langs) == 0:
-        return
-    langs = subtitle_langs if subtitle_langs is not None else COMMON_LANGS
+
+def _organize_flat_subtitles(video_id):
+    """Move flat {video_id}.{lang}.{ext} files into cache/subtitles/{video_id}/{lang}.{ext}.
+    Returns list of dicts [{"lang": "en", "file": "en.vtt"}, ...]"""
+    target_dir = os.path.join(SUBTITLES_DIR, video_id)
+    os.makedirs(target_dir, exist_ok=True)
+    moved = []
+    for f in os.listdir(SUBTITLES_DIR):
+        full = os.path.join(SUBTITLES_DIR, f)
+        if not os.path.isfile(full):
+            continue
+        name, ext = os.path.splitext(f)
+        # Match flat pattern: {video_id}.{lang}.{ext}
+        prefix = video_id + "."
+        if not name.startswith(prefix):
+            continue
+        lang = name[len(prefix):]
+        if not lang or ext not in SUBTITLE_EXTS:
+            continue
+        dst = os.path.join(target_dir, f"{lang}{ext}")
+        if not os.path.exists(dst):
+            os.rename(full, dst)
+        moved.append({"lang": lang, "file": f"{lang}{ext}"})
+    return moved
+
+
+def download_all_subtitles(video_id, url, task_id=None, langs=None):
+    """Download subtitles into organized cache/subtitles/{id}/{lang}.vtt.
+    Uses a single yt-dlp call — no pre-listing — to minimize API requests.
+    If langs is provided (list of codes), only those are requested.
+    If langs is None, the full SUBTITLE_LANGS list is used.
+    Returns list of dicts [{"lang": "en", "file": "en.vtt"}, ...]"""
+    target = langs if langs else SUBTITLE_LANGS
     sub_opts = {
         "quiet": True,
         "no_warnings": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitlesformat": "vtt",
-        "subtitleslangs": langs,
+        "subtitleslangs": target,
         "skip_download": True,
         "outtmpl": os.path.join(SUBTITLES_DIR, "%(id)s.%(ext)s"),
+        "cookiesfrombrowser": ("firefox",),
     }
     try:
         with yt_dlp.YoutubeDL(sub_opts) as ydl:
             ydl.download([url])
     except Exception:
         pass
+    _organize_flat_subtitles(video_id)
+    return _find_organized_subtitles(video_id)
+
+
+def _find_organized_subtitles(video_id):
+    """Scan cache/subtitles/{video_id}/ for subtitle files.
+    Returns list of dicts [{"lang": "en", "file": "en.vtt"}, ...]"""
+    video_sub_dir = os.path.join(SUBTITLES_DIR, video_id)
+    if not os.path.isdir(video_sub_dir):
+        return []
+    found = []
+    for f in sorted(os.listdir(video_sub_dir)):
+        name, ext = os.path.splitext(f)
+        if ext in SUBTITLE_EXTS:
+            found.append({"lang": name, "file": f})
+    return found
 
 
 def pause_download(task_id):
@@ -269,16 +352,19 @@ def resume_download(task_id, video_id, format_id):
     return download_video(video_id, format_id, task_id, resume=True)
 
 
-def download_video(video_id, format_id, task_id=None, resume=False, subtitle_langs=None):
+def download_video(video_id, format_id, task_id=None, resume=False):
     url = f"https://youtube.com/watch?v={video_id}"
     outtmpl = os.path.join(VIDEOS_DIR, "%(id)s.%(ext)s")
+    run_token = _register_run(task_id)
 
     dash_video_fmt = None
     dash_audio_fmt = None
 
     def progress_hook(d):
+        if not _is_current_run(task_id, run_token):
+            raise PauseException()
         if cancel_flags.get(task_id):
-            return
+            raise PauseException()
         if pause_flags.get(task_id):
             raise PauseException()
         if d["status"] == "downloading":
@@ -303,25 +389,13 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
             if task_id and task_id in progress_listeners:
                 progress_listeners[task_id]({"status": "processing", "percent": 100})
 
-    if subtitle_langs is None:
-        langs = COMMON_LANGS
-    elif len(subtitle_langs) == 0:
-        langs = []
-    else:
-        langs = subtitle_langs
-    write_subs = len(langs) > 0
-    write_auto = len(langs) > 0
-
     ydl_opts = {
         "format": format_id,
         "outtmpl": outtmpl,
         "merge_output_format": "mp4",
         "writethumbnail": True,
-        "writesubtitles": write_subs,
-        "writeautomaticsub": write_auto,
-        "subtitlesformat": "vtt",
-        "subtitleslangs": langs,
-        "embedsubs": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
         "ignoreerrors": True,
         "progress_hooks": [progress_hook],
         "quiet": True,
@@ -334,6 +408,8 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
 
     def run():
         nonlocal dash_video_fmt, dash_audio_fmt
+        if not _is_current_run(task_id, run_token):
+            return
         if cancel_flags.get(task_id):
             return
 
@@ -387,55 +463,9 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                             if os.path.getsize(fp) < MIN_VIDEO_SIZE:
                                 try: os.remove(fp)
                                 except: pass
-                    # Merge existing DASH files
-                    v_path = a_path = None
-                    for f in os.listdir(VIDEOS_DIR):
-                        name, ext = os.path.splitext(f)
-                        if ext not in VIDEO_EXTS or ".f" not in name or name.split(".")[0] != video_id:
-                            continue
-                        full = os.path.join(VIDEOS_DIR, f)
-                        if os.path.getsize(full) < MIN_VIDEO_SIZE:
-                            continue
-                        if ext == ".m4a":
-                            a_path = full
-                        elif not v_path:
-                            v_path = full
-                    merged_path = None
-                    if v_path and a_path:
-                        import subprocess
-                        v_ext = os.path.splitext(v_path)[1]
-                        a_ext = os.path.splitext(a_path)[1]
-                        if v_ext == ".webm":
-                            merged_ext = "webm"
-                            ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c:v", "copy"]
-                            if a_ext == ".m4a":
-                                ffmpeg_args += ["-c:a", "libopus"]
-                            else:
-                                ffmpeg_args += ["-c:a", "copy"]
-                        else:
-                            merged_ext = "mp4"
-                            ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy",
-                                           "-movflags", "+faststart"]
-                        merged = os.path.join(VIDEOS_DIR, f"{video_id}.{merged_ext}")
-                        ffmpeg_args.append(merged)
-                        result = subprocess.run(ffmpeg_args, capture_output=True, text=True)
-                        if result.returncode == 0:
-                            for p in [v_path, a_path]:
-                                try: os.remove(p)
-                                except: pass
-                            merged_path = merged
-                    subtitle_files = _find_subtitle_files(video_id)
-                    thumbnail_path = _find_thumbnail_file(video_id)
-                    if task_id and task_id in progress_listeners:
-                        progress_listeners[task_id]({"status": "done",
-                            "video_path": merged_path,
-                            "subtitles": subtitle_files,
-                            "thumbnail": thumbnail_path,
-                            "info": old_meta})
-                    return
+                    has_partials = True
 
             # Check if partial files exist from a failed download of the same format
-            has_partials = False
             # If an exact-name merged file exists, always clean slate (user is explicitly re-downloading)
             has_merged = False
             for f in os.listdir(VIDEOS_DIR):
@@ -487,25 +517,44 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                         break
 
             # Extract codecs from the matched formats
+            video_fmt_info = None
+            audio_fmt_info = None
             video_codec = None
             audio_codec = None
             for f in info_pre.get("formats", []):
                 if f.get("format_id") == format_id:
+                    video_fmt_info = f
                     video_codec = f.get("vcodec")
                 if dash_audio_fmt and f.get("format_id") == dash_audio_fmt:
+                    audio_fmt_info = f
                     audio_codec = f.get("acodec")
+            expected_video_size = None
+            expected_audio_size = None
+            if video_fmt_info:
+                expected_video_size = video_fmt_info.get("filesize") or video_fmt_info.get("filesize_approx")
+            if audio_fmt_info:
+                expected_audio_size = audio_fmt_info.get("filesize") or audio_fmt_info.get("filesize_approx")
             if video_codec or audio_codec:
-                tasks.update_task(task_id, dash_video_codec=video_codec, dash_audio_codec=audio_codec)
+                tasks.update_task(task_id,
+                    dash_video_codec=video_codec,
+                    dash_audio_codec=audio_codec,
+                    expected_video_size=expected_video_size,
+                    expected_audio_size=expected_audio_size)
 
             if dash_video_fmt and dash_audio_fmt:
                 # Parallel DASH download
                 dash_outtmpl = os.path.join(VIDEOS_DIR, "%(id)s.f%(format_id)s.%(ext)s")
-                shared = {"v_done": 0, "a_done": 0, "v_total": None, "a_total": None, "done": False}
+                shared = {
+                    "v_done": 0, "a_done": 0, "v_total": None, "a_total": None,
+                    "v_finished": False, "a_finished": False,
+                }
 
                 def dash_progress(track):
                     def hook(d):
+                        if not _is_current_run(task_id, run_token):
+                            raise PauseException()
                         if cancel_flags.get(task_id):
-                            return
+                            raise PauseException()
                         if pause_flags.get(task_id):
                             raise PauseException()
                         if d["status"] == "downloading":
@@ -533,7 +582,10 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                                     "dash_video_fmt": dash_video_fmt, "dash_audio_fmt": dash_audio_fmt,
                                 })
                         elif d["status"] == "finished":
-                            shared["done"] = True
+                            if track == "v":
+                                shared["v_finished"] = True
+                            else:
+                                shared["a_finished"] = True
                     return hook
 
                 v_opts = {**ydl_opts, "format": dash_video_fmt, "outtmpl": dash_outtmpl,
@@ -572,47 +624,15 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                 if pause_flags.get(task_id):
                     raise PauseException()
 
-                sub_thread = threading.Thread(target=_download_subtitles, args=(video_id, url, subtitle_langs))
-                sub_thread.start()
-                sub_thread.join()
-
                 if task_id and task_id in progress_listeners:
                     progress_listeners[task_id]({"status": "processing", "percent": 100})
 
-                import subprocess
                 v_path = _find_dash_video(video_id, dash_video_fmt)
-                if not v_path or not os.path.exists(v_path):
-                    raise Exception(f"Video file not found for merge, checked .mp4 and .webm")
-                a_path = _find_dash_audio(video_id, dash_audio_fmt)
-                if not a_path or not os.path.exists(a_path):
-                    a_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_audio_fmt}.m4a")
-                    if not os.path.exists(a_path):
-                        a_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_audio_fmt}.mp4")
-                    if not os.path.exists(a_path):
-                        a_path = os.path.join(VIDEOS_DIR, f"{video_id}.f{dash_audio_fmt}.webm")
-                if not os.path.exists(a_path):
-                    raise Exception(f"Audio file not found for merge, checked multiple paths")
-                v_ext = os.path.splitext(v_path)[1]
-                a_ext = os.path.splitext(a_path)[1]
-                if v_ext == ".webm":
-                    merged_ext = "webm"
-                    ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c:v", "copy"]
-                    if a_ext == ".m4a":
-                        ffmpeg_args += ["-c:a", "libopus"]
-                    else:
-                        ffmpeg_args += ["-c:a", "copy"]
-                else:
-                    merged_ext = "mp4"
-                    ffmpeg_args = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy",
-                                   "-movflags", "+faststart"]
-                merged = os.path.join(VIDEOS_DIR, f"{info_pre['id']}.{merged_ext}")
-                ffmpeg_args.append(merged)
-                result = subprocess.run(ffmpeg_args, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise Exception(f"FFmpeg merge failed: {result.stderr[:500]}")
-                for p in [v_path, a_path]:
-                    try: os.remove(p)
-                    except: pass
+
+                if not _is_current_run(task_id, run_token) or pause_flags.get(task_id):
+                    raise PauseException()
+
+                download_all_subtitles(video_id, url, langs=[DEFAULT_SUBTITLE_LANG])
 
                 actual_id = info_pre["id"]
                 subtitle_files = _find_subtitle_files(actual_id)
@@ -621,7 +641,7 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                 if task_id and task_id in progress_listeners:
                     progress_listeners[task_id]({
                         "status": "done",
-                        "video_path": merged,
+                        "video_path": v_path,
                         "subtitles": subtitle_files,
                         "thumbnail": thumbnail_path,
                         "info": {
@@ -631,12 +651,15 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                             "channel": info_pre.get("channel") or info_pre.get("uploader"),
                             "description": info_pre.get("description", "")[:500],
                             "thumbnail": thumbnail_path,
+                            "dash_video_fmt": dash_video_fmt,
+                            "dash_audio_fmt": dash_audio_fmt,
                         },
                     })
             else:
                 # Single (progressive) download
-                ydl_opts["format"] = format_id
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                prog_opts = {**ydl_opts, "format": format_id,
+                             "writesubtitles": False, "writeautomaticsub": False}
+                with yt_dlp.YoutubeDL(prog_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     if cancel_flags.get(task_id):
                         return
@@ -654,6 +677,7 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                             f"Files in {VIDEOS_DIR}: {dir_files}"
                         )
 
+                download_all_subtitles(video_id, url, langs=[DEFAULT_SUBTITLE_LANG])
                 subtitle_files = _find_subtitle_files(video_id)
                 thumbnail_path = _find_thumbnail_file(video_id)
 
@@ -676,10 +700,12 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                         },
                     })
         except PauseException:
-            if task_id and task_id in progress_listeners:
+            if _is_current_run(task_id, run_token) and task_id and task_id in progress_listeners:
                 progress_listeners[task_id]({"status": "paused"})
             return
         except Exception as e:
+            if not _is_current_run(task_id, run_token):
+                return
             if cancel_flags.get(task_id):
                 return
             info_fallback = locals().get("info") or locals().get("info_pre") or {}
@@ -707,6 +733,8 @@ def download_video(video_id, format_id, task_id=None, resume=False, subtitle_lan
                 err_msg = f"Download failed at {last_pct}%: {e}" if last_pct else str(e)
                 if task_id and task_id in progress_listeners:
                     progress_listeners[task_id]({"status": "error", "error": err_msg})
+        finally:
+            _clear_run(task_id, run_token)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()

@@ -28,12 +28,13 @@
       <p>{{ video.description }}</p>
     </details>
     {% endif %}
-    {% if video.subtitles %}
     <div class="subs-info">
       <h3>Subtitles</h3>
+      {% if video.subtitles %}
       <p>{{ video.subtitles|map(attribute='lang')|join(', ') }}</p>
+      {% endif %}
+      <button class="btn" onclick="openSubModal()" style="margin-top:4px">Download Subtitles</button>
     </div>
-    {% endif %}
   </div>
 </div>
 
@@ -141,6 +142,7 @@ function deleteVideo() {
   if (!confirm('Delete "{{ video.title }}"?')) return;
   fetch('/api/library/{{ video.id }}', {method: 'DELETE'}).then(function() { window.location.href = '/'; });
 }
+
 </script>
 
 <div id="copy-overlay" class="modal hidden">
@@ -155,4 +157,5 @@ function deleteVideo() {
 </div>
 
 {% include "_format_modal.html" %}
+{% include "_subtitle_modal.html" %}
 {% endblock %}

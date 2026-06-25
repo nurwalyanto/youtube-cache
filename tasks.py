@@ -95,7 +95,7 @@ def mark_interrupted():
     tasks = _load()
     changed = False
     for tid, t in tasks.items():
-        if t.get("status") in ("downloading", "queued", "processing", "starting"):
+        if t.get("status") in ("downloading", "queued", "processing", "starting", "pausing"):
             t["status"] = "interrupted"
             changed = True
     if changed:
@@ -170,7 +170,7 @@ def has_active_download():
     tasks = _load()
     for t in tasks.values():
         s = t.get("status")
-        if s in ("downloading", "processing", "starting"):
+        if s in ("downloading", "processing", "starting", "pausing"):
             return True
     return False
 
@@ -179,6 +179,6 @@ def get_active_download_task_id():
     tasks = _load()
     for tid, t in tasks.items():
         s = t.get("status")
-        if s in ("downloading", "processing", "starting"):
+        if s in ("downloading", "processing", "starting", "pausing"):
             return tid
     return None

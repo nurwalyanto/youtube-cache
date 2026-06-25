@@ -390,7 +390,34 @@ def stream_status(video_id):
     return result
 
 
+def list_subtitles_on_disk(video_id):
+    """Scan cache/subtitles/{video_id}/ for subtitle files.
+    Returns list of dicts [{"lang": "en", "file": "en.vtt"}, ...]"""
+    video_sub_dir = os.path.join(SUBTITLES_DIR, video_id)
+    if not os.path.isdir(video_sub_dir):
+        return []
+    found = []
+    for f in sorted(os.listdir(video_sub_dir)):
+        name, ext = os.path.splitext(f)
+        if ext in (".vtt", ".srt", ".ass"):
+            found.append({"lang": name, "file": f})
+    return found
+
+
 def get_subtitle(video_id, lang):
+    # Organized dir first: cache/subtitles/{video_id}/{lang}.{ext}
+    video_sub_dir = os.path.join(SUBTITLES_DIR, video_id)
+    if os.path.isdir(video_sub_dir):
+        for f in os.listdir(video_sub_dir):
+            name, ext = os.path.splitext(f)
+            if name == lang and ext in (".vtt", ".srt", ".ass"):
+                path = os.path.join(video_sub_dir, f)
+                with open(path, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                if ext == ".srt":
+                    content = srt_to_vtt(content)
+                return content, "text/vtt"
+    # Fallback to flat files: cache/subtitles/{video_id}_{lang}.{ext}
     for f in os.listdir(SUBTITLES_DIR):
         name, ext = os.path.splitext(f)
         expected = f"{video_id}_{lang}"
@@ -398,11 +425,9 @@ def get_subtitle(video_id, lang):
             path = os.path.join(SUBTITLES_DIR, f)
             with open(path, "r", encoding="utf-8") as fh:
                 content = fh.read()
-            mime = "text/vtt"
             if ext == ".srt":
                 content = srt_to_vtt(content)
-                mime = "text/vtt"
-            return content, mime
+            return content, "text/vtt"
     return None, None
 
 

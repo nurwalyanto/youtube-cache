@@ -1,0 +1,127 @@
+<div id="sub-modal" class="modal hidden">
+  <div class="modal-content">
+    <span class="close" onclick="closeSubModal()">&times;</span>
+    <h2>Download Subtitles</h2>
+    <div id="sub-modal-loading" style="color:#888;font-size:0.9em;padding:12px 0">Detecting available languages...</div>
+    <div id="sub-modal-langs" class="hidden" style="margin-top:8px"></div>
+    <div id="sub-modal-actions" class="hidden" style="margin-top:12px">
+      <button class="btn" onclick="startSubDownload()" id="sub-dl-btn">Download</button>
+    </div>
+    <div id="sub-modal-progress" class="hidden" style="margin-top:12px">
+      <div class="progress-bar"><div id="sub-modal-fill" class="progress-fill"></div></div>
+      <p id="sub-modal-text" style="color:#888;font-size:0.8em;margin-top:4px">Starting...</p>
+    </div>
+  </div>
+</div>
+
+<script>
+var _subAvailable = null;
+
+function openSubModal() {
+  document.getElementById('sub-modal').classList.remove('hidden');
+  document.getElementById('sub-modal-loading').classList.remove('hidden');
+  document.getElementById('sub-modal-langs').classList.add('hidden');
+  document.getElementById('sub-modal-actions').classList.add('hidden');
+  document.getElementById('sub-modal-progress').classList.add('hidden');
+
+  fetch('/api/subtitles/' + VIDEO_ID).then(function(r) { return r.json(); }).then(function(data) {
+    var available = data.available;
+    var onDisk = data.on_disk;
+    var keys = Object.keys(available);
+    if (keys.length === 0) {
+      document.getElementById('sub-modal-loading').textContent = 'No subtitles available for this video.';
+      document.getElementById('sub-modal-actions').classList.remove('hidden');
+      document.getElementById('sub-dl-btn').disabled = true;
+      document.getElementById('sub-dl-btn').textContent = 'None available';
+      return;
+    }
+    _subAvailable = available;
+    document.getElementById('sub-modal-loading').classList.add('hidden');
+    renderSubLangList(available, onDisk);
+  })['catch'](function() {
+    document.getElementById('sub-modal-loading').textContent = 'Failed to detect subtitles.';
+  });
+}
+
+function closeSubModal() {
+  document.getElementById('sub-modal').classList.add('hidden');
+}
+
+function renderSubLangList(available, onDisk) {
+  var onDiskSet = {};
+  if (onDisk) onDisk.forEach(function(l) { onDiskSet[l] = true; });
+
+  var manual = [], auto = [];
+  Object.keys(available).forEach(function(lang) {
+    if (available[lang] === 'manual') manual.push(lang);
+    else auto.push(lang);
+  });
+
+  var html = '';
+  manual.concat(auto).forEach(function(lang) {
+    var label = available[lang] === 'manual' ? 'manual' : 'auto';
+    var already = onDiskSet[lang];
+    html += '<label style="display:block;margin:4px 0;cursor:pointer;font-size:0.9em">';
+    html += '<input type="checkbox" class="sub-lang-cb" value="' + lang + '"' + (already ? ' checked disabled' : ' checked') + '> ';
+    html += '<span style="font-weight:600">' + lang + '</span>';
+    html += ' <span style="color:#888;font-size:0.85em">(' + label + ')</span>';
+    if (already) html += ' <span style="color:#4caf50;font-size:0.8em">&#10003; on disk</span>';
+    html += '</label>';
+  });
+  html += '<label style="display:block;margin-top:8px;cursor:pointer;font-size:0.85em;color:#888">';
+  html += '<input type="checkbox" id="sub-select-all" checked onchange="toggleSubSelectAll()"> Select All';
+  html += '</label>';
+
+  document.getElementById('sub-modal-langs').innerHTML = html;
+  document.getElementById('sub-modal-langs').classList.remove('hidden');
+  document.getElementById('sub-modal-actions').classList.remove('hidden');
+  document.getElementById('sub-dl-btn').disabled = false;
+  document.getElementById('sub-dl-btn').textContent = 'Download';
+}
+
+function toggleSubSelectAll() {
+  var checked = document.getElementById('sub-select-all').checked;
+  document.querySelectorAll('.sub-lang-cb').forEach(function(cb) { cb.checked = checked; });
+}
+
+function startSubDownload() {
+  var langs = [];
+  document.querySelectorAll('.sub-lang-cb:checked').forEach(function(cb) { langs.push(cb.value); });
+  if (langs.length === 0) return;
+
+  document.getElementById('sub-modal-langs').classList.add('hidden');
+  document.getElementById('sub-modal-actions').classList.add('hidden');
+  document.getElementById('sub-modal-progress').classList.remove('hidden');
+  document.getElementById('sub-modal-fill').style.width = '0%';
+  document.getElementById('sub-modal-text').textContent = 'Starting...';
+
+  fetch('/api/subtitles/' + VIDEO_ID, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({langs: langs})
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.status === 'started') {
+      var poll = setInterval(function() {
+        fetch('/api/progress/' + data.task_id).then(function(r) { return r.json(); }).then(function(t) {
+          if (t.status === 'done') {
+            clearInterval(poll);
+            document.getElementById('sub-modal-fill').style.width = '100%';
+            document.getElementById('sub-modal-text').textContent = 'Done! Reloading...';
+            setTimeout(function() { location.reload(); }, 1000);
+          } else if (t.status === 'error') {
+            clearInterval(poll);
+            document.getElementById('sub-modal-text').textContent = 'Error: ' + (t.error || 'failed');
+          } else {
+            document.getElementById('sub-modal-fill').style.width = (t.percent || 0) + '%';
+            document.getElementById('sub-modal-text').textContent = (t.percent || 0) + '%';
+          }
+        });
+      }, 1500);
+    } else {
+      document.getElementById('sub-modal-text').textContent = 'Failed to start';
+    }
+  })['catch'](function() {
+    document.getElementById('sub-modal-text').textContent = 'Network error';
+  });
+}
+</script>

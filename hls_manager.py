@@ -227,6 +227,27 @@ def _save_meta(video_id, meta):
         json.dump(meta, f, indent=2)
 
 
+def _sources_complete(meta, video_path=None, audio_path=None):
+    """Check if source files have reached their expected sizes.
+    Uses actual file sizes from disk if paths provided, else meta sources.
+    Returns True if no expected sizes recorded or actual meets expected."""
+    expected = meta.get("expected_sizes", {})
+    for key in ("video", "audio"):
+        exp = expected.get(key)
+        if exp is None or exp <= 0:
+            continue
+        if video_path is not None and audio_path is not None:
+            path = video_path if key == "video" else audio_path
+            if not path or not os.path.exists(path):
+                return False
+            actual = os.path.getsize(path)
+        else:
+            actual = meta.get("sources", {}).get(key, {}).get("size", 0)
+        if actual < exp * 0.9:
+            return False
+    return True
+
+
 def initialize(video_id, video_path, audio_path):
     """Create meta.json from source files without generating segments.
     Returns True if metadata is ready (newly created or already existed)."""
@@ -236,10 +257,19 @@ def initialize(video_id, video_path, audio_path):
     invalidate(video_id)
     codec = _detect_codec(video_path)
     seg_type = segment_type_for_codec(codec)
+    import tasks
+    expected_video_size = None
+    expected_audio_size = None
+    for t in tasks.get_active_tasks().values():
+        if t["video_id"] == video_id:
+            expected_video_size = t.get("expected_video_size")
+            expected_audio_size = t.get("expected_audio_size")
+            break
     meta = {
         "seg_type": seg_type,
         "codec": codec,
         "sources": get_source_info(video_path, audio_path),
+        "expected_sizes": {"video": expected_video_size, "audio": expected_audio_size},
         "segments": {},
     }
     _save_meta(video_id, meta)
@@ -255,6 +285,9 @@ def get_or_create_segment(video_id, video_path, audio_path, n):
     """
     meta = _load_meta(video_id)
     sources_ok = meta and sources_match(meta, video_path, audio_path)
+
+    # Preserve expected_sizes across cache invalidations
+    prev_expected = meta.get("expected_sizes") if meta else None
 
     # Fast path: segment already cached and sources unchanged
     if sources_ok:
@@ -289,6 +322,7 @@ def get_or_create_segment(video_id, video_path, audio_path, n):
         "seg_type": seg_type,
         "codec": codec,
         "sources": get_source_info(video_path, audio_path),
+        "expected_sizes": prev_expected or {"video": None, "audio": None},
         "segments": seg_map,
     }
     _save_meta(video_id, meta)
@@ -349,10 +383,15 @@ def build_playlist(video_id, include_endlist=True):
 
 
 def is_playlist_complete(video_id):
-    """Check if ENDLIST should be included (no active downloads)."""
+    """Check if ENDLIST should be included (no active downloads, sources complete)."""
     import tasks
-    return not any(t["video_id"] == video_id
-                   for t in tasks.get_active_tasks().values())
+    if any(t["video_id"] == video_id
+           for t in tasks.get_active_tasks().values()):
+        return False
+    meta = _load_meta(video_id)
+    if not meta:
+        return True
+    return _sources_complete(meta)
 
 
 # ─── Cache lifecycle ───────────────────────────────────
