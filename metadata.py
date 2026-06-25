@@ -41,3 +41,15 @@ def get_video(video_id):
         if v["id"] == video_id:
             return v
     return None
+
+def find_by_title(title):
+    meta = load_metadata()
+    for v in meta:
+        if v.get("title") == title:
+            return v
+    alt = title.replace('-', '/')
+    if alt != title:
+        for v in meta:
+            if v.get("title") == alt:
+                return v
+    return None

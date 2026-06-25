@@ -186,6 +186,50 @@ def _find_merged_file(video_id):
             return os.path.join(VIDEOS_DIR, f)
     return None
 
+
+def merge_dash_to_mkv(video_id):
+    """Merge DASH video + audio + subtitles into a single MKV. No re-encode."""
+    from streamer import _get_dash_paths, list_subtitles_on_disk
+    v_path, a_path = _get_dash_paths(video_id)
+    if not v_path:
+        return None
+    output = os.path.join(VIDEOS_DIR, f"{video_id}.mkv")
+    if os.path.exists(output):
+        return output
+    cmd = [FFMPEG_PATH, "-y", "-i", v_path]
+    if a_path:
+        cmd += ["-i", a_path]
+    subs = list_subtitles_on_disk(video_id)
+    sub_inputs = []
+    for s in subs:
+        sf = os.path.join(SUBTITLES_DIR, video_id, s["file"])
+        if os.path.exists(sf):
+            cmd += ["-i", sf]
+            sub_inputs.append(s)
+    cmd += ["-map", "0:v:0"]
+    if a_path:
+        cmd += ["-map", "1:a:0"]
+    sub_base = 2 if a_path else 1
+    for i in range(len(sub_inputs)):
+        cmd += ["-map", str(sub_base + i)]
+    cmd += ["-c:v", "copy", "-c:a", "copy"]
+    if sub_inputs:
+        cmd += ["-c:s", "webvtt"]
+    cmd += ["-movflags", "+faststart", output]
+    try:
+        import subprocess
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            raise Exception(r.stderr[:200])
+        if os.path.exists(output) and os.path.getsize(output) >= 102400:
+            return output
+    except Exception:
+        if os.path.exists(output):
+            try: os.remove(output)
+            except: pass
+    return None
+
+
 def _find_partial_dash(video_id):
     for f in os.listdir(VIDEOS_DIR):
         name, ext = os.path.splitext(f)
@@ -653,6 +697,7 @@ def download_video(video_id, format_id, task_id=None, resume=False):
                             "thumbnail": thumbnail_path,
                             "dash_video_fmt": dash_video_fmt,
                             "dash_audio_fmt": dash_audio_fmt,
+                            "upload_date": info_pre.get("upload_date"),
                         },
                     })
             else:
@@ -697,6 +742,7 @@ def download_video(video_id, format_id, task_id=None, resume=False):
                             "channel": info.get("channel") or info.get("uploader"),
                             "description": info.get("description", "")[:500],
                             "thumbnail": thumbnail_path,
+                            "upload_date": info.get("upload_date"),
                         },
                     })
         except PauseException:
@@ -726,6 +772,7 @@ def download_video(video_id, format_id, task_id=None, resume=False):
                             "channel": info_fallback.get("channel") or info_fallback.get("uploader", "Unknown"),
                             "description": "",
                             "thumbnail": thumbnail_path,
+                            "upload_date": info_fallback.get("upload_date"),
                         },
                     })
             else:

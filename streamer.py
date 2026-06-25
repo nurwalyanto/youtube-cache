@@ -1,11 +1,13 @@
 import mimetypes
 import os
 import re
+import math
 from flask import request, Response, abort, send_file
 
 from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, HLS_SEGMENT_DURATION
 import tasks
 import hls_manager
+import metadata
 
 mimetypes.add_type('image/webp', '.webp')
 
@@ -392,16 +394,21 @@ def stream_status(video_id):
 
 def list_subtitles_on_disk(video_id):
     """Scan cache/subtitles/{video_id}/ for subtitle files.
-    Returns list of dicts [{"lang": "en", "file": "en.vtt"}, ...]"""
+    Deduplicates by language: prefers .srt > .vtt > .ass.
+    Returns list of dicts [{"lang": "en", "file": "en.srt"}, ...]"""
     video_sub_dir = os.path.join(SUBTITLES_DIR, video_id)
     if not os.path.isdir(video_sub_dir):
         return []
-    found = []
-    for f in sorted(os.listdir(video_sub_dir)):
+    ext_priority = {".srt": 0, ".vtt": 1, ".ass": 2}
+    best = {}
+    for f in os.listdir(video_sub_dir):
         name, ext = os.path.splitext(f)
-        if ext in (".vtt", ".srt", ".ass"):
-            found.append({"lang": name, "file": f})
-    return found
+        if ext not in ext_priority:
+            continue
+        prio = ext_priority[ext]
+        if name not in best or prio < ext_priority[os.path.splitext(best[name]["file"])[1]]:
+            best[name] = {"lang": name, "file": f}
+    return [best[k] for k in sorted(best)]
 
 
 def get_subtitle(video_id, lang):
@@ -453,3 +460,116 @@ def get_thumbnail(video_id):
             mime, _ = mimetypes.guess_type(f)
             return os.path.join(VIDEOS_DIR, f), mime or "image/jpeg"
     return None, None
+
+
+# ─── HLS Simple (byte-range friendly, no ffmpeg) ──────
+
+def _video_duration(video_id):
+    vid = metadata.get_video(video_id)
+    if vid and vid.get("duration"):
+        return max(int(vid["duration"]), 1)
+    return 30
+
+def _video_file_info(video_id):
+    """Return (file_path, is_dash) for the video, or (None, False)."""
+    v_path, a_path = _get_dash_paths(video_id)
+    if v_path:
+        return v_path, True
+    path = get_video_path(video_id, exact_only=False)
+    if path:
+        return path, False
+    return None, False
+
+def hls_simple_master_playlist(video_id, host_url=""):
+    """Single-entry VOD HLS master playlist pointing to /stream/ and VTT subtitle URIs.
+    Uses absolute URLs for Kodi compatibility.
+    Returns m3u8 string or None if no video file exists."""
+    v_file = _video_file_info(video_id)[0]
+    if not v_file:
+        return None
+    dur = _video_duration(video_id)
+    size = os.path.getsize(v_file)
+    bandwidth = max(int(size * 8 / dur), 100000)
+    subs = list_subtitles_on_disk(video_id)
+    base = host_url.rstrip("/")
+
+    lines = ["#EXTM3U", "#EXT-X-VERSION:4"]
+
+    for s in subs:
+        lang_code = s["lang"].split("-")[0]
+        lines.append(
+            f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",'
+            f'LANGUAGE="{lang_code}",NAME="{s["lang"]}",'
+            f'DEFAULT=YES,AUTOSELECT=YES,'
+            f'URI="{base}/api/hls-simple/{video_id}/subs_{s["lang"]}.vtt"'
+        )
+
+    stream_inf = f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"
+    if subs:
+        stream_inf += ',SUBTITLES="subs"'
+
+    lines.append(stream_inf)
+    lines.append(f"{base}/stream/{video_id}")
+    return "\n".join(lines) + "\n"
+
+def hls_simple_video_playlist(video_id):
+    """Single-entry video playlist -> /stream/{id}."""
+    v_file, _ = _video_file_info(video_id)
+    if not v_file:
+        return None
+    dur = _video_duration(video_id)
+    td = max(int(dur) + 1, 1)
+    return (
+        f"#EXTM3U\n"
+        f"#EXT-X-VERSION:4\n"
+        f"#EXT-X-TARGETDURATION:{td}\n"
+        f"#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PLAYLIST-TYPE:VOD\n"
+        f"#EXTINF:{dur:.1f},\n"
+        f"/stream/{video_id}\n"
+        f"#EXT-X-ENDLIST\n"
+    )
+
+def hls_simple_audio_playlist(video_id):
+    """Single-entry audio playlist -> /stream_audio/{id}.  Returns None if no audio."""
+    _, a_path = _get_dash_paths(video_id)
+    if not a_path:
+        return None
+    dur = _video_duration(video_id)
+    td = max(int(dur) + 1, 1)
+    return (
+        f"#EXTM3U\n"
+        f"#EXT-X-VERSION:4\n"
+        f"#EXT-X-TARGETDURATION:{td}\n"
+        f"#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PLAYLIST-TYPE:VOD\n"
+        f"#EXTINF:{dur:.1f},\n"
+        f"/stream_audio/{video_id}\n"
+        f"#EXT-X-ENDLIST\n"
+    )
+
+def hls_simple_subtitle_playlist(video_id, lang):
+    """Single-entry subtitle playlist -> subs_{lang}.vtt (relative, resolves under /api/hls-simple/)."""
+    dur = _video_duration(video_id)
+    td = max(int(dur) + 1, 1)
+    return (
+        f"#EXTM3U\n"
+        f"#EXT-X-VERSION:4\n"
+        f"#EXT-X-TARGETDURATION:{td}\n"
+        f"#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXT-X-PLAYLIST-TYPE:VOD\n"
+        f"#EXTINF:{dur:.1f},\n"
+        f"subs_{lang}.vtt\n"
+        f"#EXT-X-ENDLIST\n"
+    )
+
+def hls_simple_available(video_id):
+    """Check if HLS simple mode can be used (any video file exists on disk)."""
+    return _video_file_info(video_id)[0] is not None
+
+def hls_simple_mtime(video_id):
+    """Get modification time of any video file for this video."""
+    v_file, _ = _video_file_info(video_id)
+    if v_file:
+        return os.path.getmtime(v_file)
+    return None

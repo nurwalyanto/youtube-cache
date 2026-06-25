@@ -6,6 +6,7 @@ import shutil
 import xml.etree.ElementTree as ET
 import mimetypes
 from email import utils
+from urllib.parse import quote
 from flask import Flask, render_template, request, jsonify, Response, send_file, abort, redirect
 
 from config import (
@@ -48,8 +49,20 @@ from streamer import (
     stream_video, stream_audio_track, get_subtitle, get_thumbnail,
     hls_master_playlist, hls_serve_file,
     stream_status, get_video_path, list_subtitles_on_disk,
+    hls_simple_master_playlist,
 )
 import hls_manager
+
+
+def _clean_webvtt(content):
+    """Strip complex WebVTT formatting (cue span tags, embedded timestamps, positioning)
+    that Kodi's HLS player may not support."""
+    import re
+    content = re.sub(r'</?c[^>]*>', '', content)
+    content = re.sub(r'<\d{2}:\d{2}:\d{2}\.\d{3}>', '', content)
+    content = re.sub(r' align:start position:\d+%', '', content)
+    return content
+
 
 app = Flask(__name__)
 dlna_server = None
@@ -122,14 +135,21 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
                     lang = stem.rsplit("_", 1)[-1]
                 subtitle_list.append({"lang": lang, "file": f_name})
             thumb_url = f"/thumb/{info['id']}" if evt.get("thumbnail") else ""
+            actual_id = info.get("id", video_id)
             metadata.add_video({
-                "id": info["id"], "title": info.get("title", "Unknown"),
+                "id": actual_id, "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0), "channel": info.get("channel", "Unknown"),
                 "description": info.get("description", ""), "thumbnail": thumb_url,
                 "subtitles": subtitle_list, "format_label": format_label, "format_id": format_id,
+                "upload_date": info.get("upload_date"),
             })
             tasks.complete_task(task_id)
             _start_next_queued()
+            if info.get("dash_video_fmt"):
+                threading.Thread(
+                    target=downloader.merge_dash_to_mkv,
+                    args=(actual_id,), daemon=True
+                ).start()
         elif status == "error":
             tasks.fail_task(task_id, evt.get("error", "Unknown error"))
             metadata.add_video({
@@ -482,6 +502,29 @@ def api_hls_master(video_id):
 def api_hls_file(video_id, filename):
     return hls_serve_file(video_id, filename)
 
+
+@app.route("/api/hls-simple/<video_id>/<path:filename>")
+def api_hls_simple(video_id, filename):
+    if filename == "master.m3u8":
+        content = hls_simple_master_playlist(video_id, request.host_url)
+        if content is None:
+            return Response(status=204)
+        return Response(content, mimetype="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-cache"})
+    if filename.startswith("subs_"):
+        for ext in (".vtt", ".srt"):
+            if filename.endswith(ext):
+                lang = filename[5:-len(ext)]
+                content, mime = get_subtitle(video_id, lang)
+                if content is None:
+                    return abort(404)
+                content = _clean_webvtt(content)
+                return Response(content, mimetype="text/vtt",
+                                headers={"Access-Control-Allow-Origin": "*",
+                                         "Cache-Control": "no-cache"})
+    return abort(404)
+
+
 @app.route("/api/stream-info/<video_id>")
 def api_stream_info(video_id):
     return jsonify(stream_status(video_id))
@@ -503,7 +546,8 @@ def rss_feed():
     atom_link.set("type", "application/rss+xml")
 
     for v in metadata.load_metadata():
-        path = get_video_path(v["id"], exact_only=False)
+        vid = v["id"]
+        path = get_video_path(vid, exact_only=False)
         if not path:
             continue
         mime, _ = mimetypes.guess_type(path)
@@ -512,35 +556,155 @@ def rss_feed():
 
         item = ET.SubElement(ch, "item")
         ET.SubElement(item, "title").text = v.get("title", "Unknown")
-        ET.SubElement(item, "link").text = request.host_url.rstrip("/") + f"/video/{v['id']}"
-        ET.SubElement(item, "guid").text = v["id"]
+        ET.SubElement(item, "link").text = request.host_url.rstrip("/") + f"/video/{vid}"
+        ET.SubElement(item, "guid").text = vid
         ET.SubElement(item, "pubDate").text = utils.formatdate(mtime, usegmt=True)
 
         desc = v.get("description", "") or v.get("channel", "")
         ET.SubElement(item, "description").text = desc
 
         enc = ET.SubElement(item, "enclosure")
-        enc.set("url", request.host_url.rstrip("/") + f"/stream/{v['id']}")
+        enc.set("url", request.host_url.rstrip("/") + f"/stream/{vid}")
         enc.set("type", mime or "video/mp4")
         enc.set("length", str(size))
 
-        thumb = ET.SubElement(item, "{http://search.yahoo.com/mrss/}thumbnail")
-        thumb.set("url", request.host_url.rstrip("/") + f"/thumb/{v['id']}")
+        mc = ET.SubElement(item, "{http://search.yahoo.com/mrss/}content")
+        mc.set("url", request.host_url.rstrip("/") + f"/api/hls-simple/{vid}/master.m3u8")
+        mc.set("type", "application/vnd.apple.mpegurl")
+        for s in list_subtitles_on_disk(vid):
+            sub = ET.SubElement(mc, "{http://search.yahoo.com/mrss/}subTitle")
+            sub.set("type", "text/vtt")
+            sub.set("lang", s["lang"])
 
-        subs = list_subtitles_on_disk(v["id"])
-        if subs:
-            langs = ",".join(s["lang"] for s in subs)
-            sub_elem = ET.SubElement(item, "subtitle")
-            sub_elem.set("langs", langs)
-            for s in subs:
-                sub_link = ET.SubElement(item, "subtitle")
-                sub_link.set("lang", s["lang"])
-                sub_link.text = request.host_url.rstrip("/") + f"/subtitle/{v['id']}/{s['lang']}"
+        thumb = ET.SubElement(item, "{http://search.yahoo.com/mrss/}thumbnail")
+        thumb.set("url", request.host_url.rstrip("/") + f"/thumb/{vid}")
 
     return Response(
         ET.tostring(rss, encoding="unicode", xml_declaration=True),
         mimetype="application/rss+xml",
     )
+
+def _fmt_size(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def _fmt_time(ts):
+    import time
+    return time.strftime("%d-%b-%Y %H:%M", time.gmtime(ts))
+
+
+def _apache_line(display_name, href, date, size, title=None):
+    """Apache-style listing line."""
+    extra = f' title="{title}"' if title else ""
+    if not date and not size:
+        return f'<a href="{href}"{extra}>{display_name}</a>'
+    pad = " " * max(1, 50 - len(display_name))
+    sz = size if size else "-"
+    return f'<a href="{href}"{extra}>{display_name}</a>{pad}{date}    {sz:>8}'
+
+
+def _apache_page(title, entries):
+    """Build a full Apache-style HTML page."""
+    head = (
+        '<html>\n'
+        f'<head><title>Index of {title}</title></head>\n'
+        '<body>\n'
+        f'<h1>Index of {title}</h1><hr><pre>'
+    )
+    return head + "\n".join(entries) + "\n</pre><hr></body>\n</html>\n"
+
+
+def _resolve_slug(slug):
+    """Resolve a URL slug to video metadata. Slug may be a video_id or a title."""
+    v = metadata.get_video(slug)
+    if v:
+        return v
+    return metadata.find_by_title(slug)
+
+
+def _slug_for_video(v):
+    title = v.get("title", v["id"])
+    safe = title.replace("/", "-")
+    return quote(safe, safe='')
+
+
+@app.route("/browse")
+@app.route("/browse/")
+def browse_root():
+    items = []
+    for v in metadata.load_metadata():
+        path = get_video_path(v["id"], exact_only=False)
+        if not path:
+            continue
+        items.append(v)
+    if not items:
+        return Response(_apache_page("/browse/", ['<a href="../">../</a>']), mimetype="text/html")
+    entries = ['<a href="../">../</a>']
+    for v in items:
+        title = v.get("title", v["id"])
+        href = _slug_for_video(v) + "/"
+        display = title + "/"
+        path = get_video_path(v["id"], exact_only=False)
+        mt = _fmt_time(os.path.getmtime(path))
+        entries.append(_apache_line(display, href, mt, "-", title=title))
+    return Response(_apache_page("/browse/", entries), mimetype="text/html")
+
+
+@app.route("/browse/<slug>")
+@app.route("/browse/<slug>/")
+def browse_video(slug):
+    import os
+    from streamer import _get_dash_paths
+    meta = _resolve_slug(slug)
+    if not meta:
+        return abort(404)
+    video_id = meta["id"]
+    items = []
+    v_path, a_path = _get_dash_paths(video_id)
+    merged = downloader._find_merged_file(video_id)
+    stream_path = merged or v_path
+    if stream_path:
+        base = os.path.basename(stream_path)
+        items.append((base, _fmt_size(os.path.getsize(stream_path)), os.path.getmtime(stream_path)))
+    if a_path and not merged:
+        base = os.path.basename(a_path)
+        items.append((base, _fmt_size(os.path.getsize(a_path)), os.path.getmtime(a_path)))
+    for s in list_subtitles_on_disk(video_id):
+        sp = os.path.join(SUBTITLES_DIR, video_id, s["file"])
+        if os.path.exists(sp):
+            items.append((s["file"], _fmt_size(os.path.getsize(sp)), os.path.getmtime(sp)))
+    entries = ['<a href="../">../</a>']
+    for name, size_str, mtime in items:
+        entries.append(_apache_line(name, name, _fmt_time(mtime), size_str))
+    title_hdr = meta.get("title", slug)
+    return Response(_apache_page(f"/browse/{title_hdr}/", entries), mimetype="text/html")
+
+
+@app.route("/browse/<slug>/<path:filename>")
+def browse_video_file(slug, filename):
+    import os, mimetypes
+    from streamer import _get_dash_paths
+    meta = _resolve_slug(slug)
+    if not meta:
+        return abort(404)
+    video_id = meta["id"]
+    sub_path = os.path.join(SUBTITLES_DIR, video_id, filename)
+    if os.path.exists(sub_path) and os.path.isfile(sub_path):
+        raw = open(sub_path, "rb").read()
+        mime, _ = mimetypes.guess_type(sub_path)
+        if filename.endswith(".vtt"):
+            raw = _clean_webvtt(raw.decode("utf-8")).encode("utf-8")
+        return Response(raw, mimetype=mime or "text/plain")
+    merged = downloader._find_merged_file(video_id)
+    if merged and os.path.basename(merged) == filename:
+        mime, _ = mimetypes.guess_type(merged)
+        return Response(open(merged, "rb").read(), mimetype=mime or "video/mp4")
+    return abort(404)
+
 
 @app.route("/api/subtitles/<video_id>", methods=["GET"])
 def api_subtitles_list(video_id):
