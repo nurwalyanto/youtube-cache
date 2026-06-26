@@ -301,15 +301,17 @@ def api_download():
             downloader.pause_download(tid)
             return jsonify({"task_id": tid, "status": "pausing"})
 
-        # queued -> promote to the front. If another worker is active, wait for its paused event.
+        # queued -> promote to the front. Displace active task to queue front so it auto-resumes later.
         if status == "queued":
             tasks.dequeue_task(tid)
             active_tid = tasks.get_active_download_task_id()
             if active_tid:
-                tasks.update_task(active_tid, status="pausing")
+                tasks.update_task(active_tid, status="queued")
+                tasks.queue_task_front(active_tid)
+                downloader.pause_download(active_tid)
                 tasks.queue_task_front(tid)
                 tasks.update_task(tid, status="queued")
-                downloader.pause_download(active_tid)
+                _start_next_queued()
                 return jsonify({"task_id": tid, "status": "queued"})
             listener = _make_listener(tid, video_id, title, thumbnail, format_label, format_id)
             downloader.progress_listeners[tid] = listener
@@ -395,10 +397,12 @@ def api_resume_task(task_id):
         tasks.dequeue_task(task_id)
         active_tid = tasks.get_active_download_task_id()
         if active_tid:
-            tasks.update_task(active_tid, status="pausing")
+            tasks.update_task(active_tid, status="queued")
+            tasks.queue_task_front(active_tid)
+            downloader.pause_download(active_tid)
             tasks.queue_task_front(task_id)
             tasks.update_task(task_id, status="queued")
-            downloader.pause_download(active_tid)
+            _start_next_queued()
             return jsonify({"ok": True, "status": "queued"})
         listener = _make_listener(task_id, vid, title, thumb, fmt_label, fmt)
         downloader.progress_listeners[task_id] = listener
