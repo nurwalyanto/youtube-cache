@@ -147,7 +147,7 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
             _start_next_queued()
             if info.get("dash_video_fmt"):
                 threading.Thread(
-                    target=downloader.merge_dash_to_mkv,
+                    target=downloader.merge_dash,
                     args=(actual_id,), daemon=True
                 ).start()
         elif status == "error":
@@ -658,21 +658,15 @@ def browse_root():
 @app.route("/browse/<slug>/")
 def browse_video(slug):
     import os
-    from streamer import _get_dash_paths
     meta = _resolve_slug(slug)
     if not meta:
         return abort(404)
     video_id = meta["id"]
     items = []
-    v_path, a_path = _get_dash_paths(video_id)
     merged = downloader._find_merged_file(video_id)
-    stream_path = merged or v_path
-    if stream_path:
-        base = os.path.basename(stream_path)
-        items.append((base, _fmt_size(os.path.getsize(stream_path)), os.path.getmtime(stream_path)))
-    if a_path and not merged:
-        base = os.path.basename(a_path)
-        items.append((base, _fmt_size(os.path.getsize(a_path)), os.path.getmtime(a_path)))
+    if merged:
+        base = os.path.basename(merged)
+        items.append((base, _fmt_size(os.path.getsize(merged)), os.path.getmtime(merged)))
     for s in list_subtitles_on_disk(video_id):
         sp = os.path.join(SUBTITLES_DIR, video_id, s["file"])
         if os.path.exists(sp):
@@ -687,7 +681,6 @@ def browse_video(slug):
 @app.route("/browse/<slug>/<path:filename>")
 def browse_video_file(slug, filename):
     import os, mimetypes
-    from streamer import _get_dash_paths
     meta = _resolve_slug(slug)
     if not meta:
         return abort(404)
@@ -702,7 +695,7 @@ def browse_video_file(slug, filename):
     merged = downloader._find_merged_file(video_id)
     if merged and os.path.basename(merged) == filename:
         mime, _ = mimetypes.guess_type(merged)
-        return Response(open(merged, "rb").read(), mimetype=mime or "video/mp4")
+        return send_file(merged, mimetype=mime, conditional=True)
     return abort(404)
 
 

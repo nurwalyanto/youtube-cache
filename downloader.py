@@ -187,41 +187,38 @@ def _find_merged_file(video_id):
     return None
 
 
-def merge_dash_to_mkv(video_id):
-    """Merge DASH video + audio + subtitles into a single MKV. No re-encode."""
-    from streamer import _get_dash_paths, list_subtitles_on_disk
+def merge_dash(video_id):
+    """Merge DASH video + audio into a single file (mp4/webm). No re-encode."""
+    from streamer import _get_dash_paths
     v_path, a_path = _get_dash_paths(video_id)
     if not v_path:
         return None
-    output = os.path.join(VIDEOS_DIR, f"{video_id}.mkv")
+    v_ext = os.path.splitext(v_path)[1]
+    a_ext = os.path.splitext(a_path)[1] if a_path else ""
+    if v_ext == ".webm":
+        merged_ext = "webm"
+        cmd = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c:v", "copy"]
+        if a_ext == ".m4a":
+            cmd += ["-c:a", "libopus"]
+        else:
+            cmd += ["-c:a", "copy"]
+    else:
+        merged_ext = "mp4"
+        cmd = [FFMPEG_PATH, "-y", "-i", v_path, "-i", a_path, "-c", "copy",
+               "-movflags", "+faststart"]
+    output = os.path.join(VIDEOS_DIR, f"{video_id}.{merged_ext}")
     if os.path.exists(output):
         return output
-    cmd = [FFMPEG_PATH, "-y", "-i", v_path]
-    if a_path:
-        cmd += ["-i", a_path]
-    subs = list_subtitles_on_disk(video_id)
-    sub_inputs = []
-    for s in subs:
-        sf = os.path.join(SUBTITLES_DIR, video_id, s["file"])
-        if os.path.exists(sf):
-            cmd += ["-i", sf]
-            sub_inputs.append(s)
-    cmd += ["-map", "0:v:0"]
-    if a_path:
-        cmd += ["-map", "1:a:0"]
-    sub_base = 2 if a_path else 1
-    for i in range(len(sub_inputs)):
-        cmd += ["-map", str(sub_base + i)]
-    cmd += ["-c:v", "copy", "-c:a", "copy"]
-    if sub_inputs:
-        cmd += ["-c:s", "webvtt"]
-    cmd += ["-movflags", "+faststart", output]
+    cmd.append(output)
     try:
         import subprocess
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             raise Exception(r.stderr[:200])
         if os.path.exists(output) and os.path.getsize(output) >= 102400:
+            for p in [v_path, a_path]:
+                try: os.remove(p)
+                except: pass
             return output
     except Exception:
         if os.path.exists(output):
