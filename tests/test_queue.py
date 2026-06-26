@@ -511,3 +511,30 @@ class TestAppLogic:
         td.update_task("a", status="starting")
         assert td.get_active_download_task_id() == "a"
         assert td.get_queue() == []
+
+    def test_force_resume_then_complete_promotes_queued(self, td):
+        """
+        A downloading, B queued -> force-resume B (A to queue front)
+        -> B completes -> A starts from queue.
+        """
+        td.create_task("a", "v_a", "A", "", "f1", "720p")
+        td.update_task("a", status="downloading")
+        td.create_task("b", "v_b", "B", "", "f1", "720p")
+        td.queue_task("b")
+        # Force-resume B (A gets queued at front)
+        td.dequeue_task("b")
+        active_id = td.get_active_download_task_id()
+        td.update_task(active_id, status="queued")
+        td.queue_task_front(active_id)
+        td.update_task("b", status="starting")
+        assert td.get_active_download_task_id() == "b"
+        assert td.get_queue() == ["a"]
+        # B completes -> A resumes from queue
+        td.complete_task("b")
+        assert td.has_active_download() is False
+        q = td.get_queue()
+        assert q == ["a"]
+        td.dequeue_task(q[0])
+        td.update_task("a", status="starting")
+        assert td.get_active_download_task_id() == "a"
+        assert td.get_queue() == []
