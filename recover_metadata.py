@@ -39,20 +39,39 @@ def detect_format(video_id):
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Recover metadata.json from downloaded videos")
+    parser.add_argument("--continue", dest="cont", action="store_true",
+                        help="Continue from existing metadata.json, skip already-processed IDs")
+    args = parser.parse_args()
+
     video_ids = extract_video_ids()
     print(f"Found {len(video_ids)} unique video IDs")
 
     entries = []
+    existing_ids = set()
+    if args.cont:
+        existing = metadata.load_metadata()
+        existing_ids = {v["id"] for v in existing if v.get("id")}
+        entries = list(existing)
+        skipped = [vid for vid in video_ids if vid in existing_ids]
+        if skipped:
+            print(f"Resuming: {len(existing)} existing entries, skipping {len(skipped)} already-processed IDs")
+
     for vid in video_ids:
+        if vid in existing_ids:
+            continue
         if not video_has_file(vid):
             print(f"  Skipping {vid}: no valid video file")
             continue
 
         print(f"  Fetching info for {vid}...", end=" ", flush=True)
+        info = None
         try:
             info = downloader.get_video_info(vid)
         except Exception as e:
-            print(f"ERROR: {e}")
+            print(f"SKIP (yt-dlp blocked)")
             continue
 
         subs = streamer.list_subtitles_on_disk(vid)
