@@ -4,13 +4,46 @@ import re
 import time
 import threading
 import shutil
+import sys
+import subprocess
 import yt_dlp
-from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, DEFAULT_SUBTITLE_LANG
+from config import VIDEOS_DIR, SUBTITLES_DIR, THUMBNAILS_DIR, DEFAULT_SUBTITLE_LANG, FFMPEG_THREADS, FFMPEG_LOW_PRIORITY
 import tasks
 
 FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 MIN_VIDEO_SIZE = 102400
+
+
+def _run_ffmpeg(cmd, timeout=None, check=False):
+    """Run ffmpeg with thread limit and low priority (Windows)."""
+    insert = []
+    if FFMPEG_THREADS:
+        insert += ["-threads", str(FFMPEG_THREADS)]
+    if sys.platform == "win32":
+        insert += ["-fflags", "+nobuffer", "-flags", "+low_delay"]
+    full_cmd = cmd[:1] + insert + cmd[1:] if insert else cmd
+
+    if FFMPEG_LOW_PRIORITY and sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+        proc = subprocess.Popen(
+            full_cmd,
+            creationflags=subprocess.CREATE_SUSPENDED,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        kernel32.SetPriorityClass(proc._handle, BELOW_NORMAL_PRIORITY_CLASS)
+        kernel32.ResumeThread(proc._handle)
+        stdout, stderr = proc.communicate(timeout=timeout)
+        ret = subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
+    else:
+        ret = subprocess.run(full_cmd, capture_output=True, timeout=timeout)
+
+    if check and ret.returncode != 0:
+        raise subprocess.CalledProcessError(ret.returncode, full_cmd, ret.stdout, ret.stderr)
+    return ret
 
 progress_listeners = {}
 cancel_flags = {}
@@ -132,7 +165,7 @@ SUBTITLE_LANGS = [
 
 def get_video_info(video_id):
     url = f"https://youtube.com/watch?v={video_id}"
-    ydl_opts = {"quiet": True, "no_warnings": True}
+    ydl_opts = {"quiet": True, "no_warnings": True, "cookiesfrombrowser": ("firefox",)}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -217,8 +250,7 @@ def merge_dash_to_mkv(video_id):
         cmd += ["-c:s", "webvtt"]
     cmd += ["-movflags", "+faststart", output]
     try:
-        import subprocess
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        r = _run_ffmpeg(cmd, timeout=300)
         if r.returncode != 0:
             raise Exception(r.stderr[:200])
         if os.path.exists(output) and os.path.getsize(output) >= 102400:

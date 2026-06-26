@@ -2,7 +2,8 @@ import os
 import json
 import subprocess
 import shutil
-from config import VIDEOS_DIR, HLS_DIR, FFMPEG_PATH, HLS_SEGMENT_DURATION
+import sys
+from config import VIDEOS_DIR, HLS_DIR, FFMPEG_PATH, HLS_SEGMENT_DURATION, FFMPEG_THREADS, FFMPEG_LOW_PRIORITY
 
 
 # ─── Path helpers ──────────────────────────────────────
@@ -73,6 +74,39 @@ def seg_ext(seg_type):
     return "ts" if seg_type == "mpegts" else "m4s"
 
 
+# ─── FFmpeg runner with resource limits ───────────────
+
+def _run_ffmpeg(cmd, timeout=None, check=False):
+    """Run ffmpeg with thread limit and low priority (Windows)."""
+    insert = []
+    if FFMPEG_THREADS:
+        insert += ["-threads", str(FFMPEG_THREADS)]
+    if sys.platform == "win32":
+        insert += ["-fflags", "+nobuffer", "-flags", "+low_delay"]
+    full_cmd = cmd[:1] + insert + cmd[1:] if insert else cmd
+
+    if FFMPEG_LOW_PRIORITY and sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+        proc = subprocess.Popen(
+            full_cmd,
+            creationflags=subprocess.CREATE_SUSPENDED,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        kernel32.SetPriorityClass(proc._handle, BELOW_NORMAL_PRIORITY_CLASS)
+        kernel32.ResumeThread(proc._handle)
+        stdout, stderr = proc.communicate(timeout=timeout)
+        ret = subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
+    else:
+        ret = subprocess.run(full_cmd, capture_output=True, timeout=timeout)
+
+    if check and ret.returncode != 0:
+        raise subprocess.CalledProcessError(ret.returncode, full_cmd, ret.stdout, ret.stderr)
+    return ret
+
+
 # ─── Init segment ──────────────────────────────────────
 
 def ensure_init(video_id, video_path, audio_path):
@@ -95,7 +129,7 @@ def ensure_init(video_id, video_path, audio_path):
         os.path.join(tmpdir, ".init_pl.m3u8"),
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        _run_ffmpeg(cmd, timeout=120, check=True)
         if not os.path.exists(init) or os.path.getsize(init) == 0:
             return False
         for name in list(os.listdir(tmpdir)):
@@ -169,7 +203,7 @@ def _generate_all_segments(video_id, video_path, audio_path, seg_type):
     ]
 
     try:
-        subprocess.run(cmd, capture_output=True, timeout=600)
+        _run_ffmpeg(cmd, timeout=600)
     except:
         return []
 

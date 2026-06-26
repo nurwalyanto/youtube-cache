@@ -32,4 +32,6 @@ else:
 os.makedirs(HLS_DIR, exist_ok=True)
 
 FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
+FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", "2"))
+FFMPEG_LOW_PRIORITY = os.environ.get("FFMPEG_LOW_PRIORITY", "1") == "1"
 HLS_SEGMENT_DURATION = 6
