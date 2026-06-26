@@ -92,7 +92,8 @@ def _get_dash_paths(video_id):
                     if os.path.getsize(full) >= MIN_VIDEO_SIZE:
                         a_path = full
                     break
-        return v_path, a_path
+        if v_path:
+            return v_path, a_path
     # Fallback: scan for .fXXX files even without active task (completed DASH)
     v_path = a_path = None
     for f in os.listdir(VIDEOS_DIR):

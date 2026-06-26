@@ -30,12 +30,10 @@ def _run_ffmpeg(cmd, timeout=None, check=False):
         BELOW_NORMAL_PRIORITY_CLASS = 0x4000
         proc = subprocess.Popen(
             full_cmd,
-            creationflags=subprocess.CREATE_SUSPENDED,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         kernel32.SetPriorityClass(proc._handle, BELOW_NORMAL_PRIORITY_CLASS)
-        kernel32.ResumeThread(proc._handle)
         stdout, stderr = proc.communicate(timeout=timeout)
         ret = subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
     else:
@@ -244,7 +242,7 @@ def merge_dash(video_id):
         return output
     cmd.append(output)
     try:
-        r = _run_ffmpeg(cmd, timeout=300)
+        r = _run_ffmpeg(cmd, timeout=7200)
         if r.returncode != 0:
             raise Exception(r.stderr[:200])
         if os.path.exists(output) and os.path.getsize(output) >= 102400:

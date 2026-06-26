@@ -143,13 +143,19 @@ def _make_listener(task_id, video_id, title, thumbnail, format_label, format_id)
                 "subtitles": subtitle_list, "format_label": format_label, "format_id": format_id,
                 "upload_date": info.get("upload_date"),
             })
-            tasks.complete_task(task_id)
-            _start_next_queued()
             if info.get("dash_video_fmt"):
-                threading.Thread(
-                    target=downloader.merge_dash,
-                    args=(actual_id,), daemon=True
-                ).start()
+                tasks.update_task(task_id, status="processing", percent=100)
+                def _merge_then_finish():
+                    result = downloader.merge_dash(actual_id)
+                    if result:
+                        tasks.complete_task(task_id)
+                    else:
+                        tasks.fail_task(task_id, "Merge failed: ffmpeg returned no output")
+                    _start_next_queued()
+                threading.Thread(target=_merge_then_finish, daemon=True).start()
+            else:
+                tasks.complete_task(task_id)
+                _start_next_queued()
         elif status == "error":
             tasks.fail_task(task_id, evt.get("error", "Unknown error"))
             metadata.add_video({
